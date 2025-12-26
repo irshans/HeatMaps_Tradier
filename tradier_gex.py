@@ -12,7 +12,6 @@ st.markdown("""
     <style>
     * { font-family: 'Arial', sans-serif !important; }
     .block-container { padding-top: 24px; padding-bottom: 8px; }
-    /* Compact metric styling */
     [data-testid="stMetricValue"] { font-size: 22px !important; font-family: 'Arial' !important; }
     h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; font-weight: bold; }
     </style>
@@ -140,6 +139,7 @@ def render_heatmap(df, ticker, S):
         xaxis=dict(type='category', side='top', tickfont=dict(size=12)),
         yaxis=dict(
             title="Strike", tickmode='array', tickvals=y_labs,
+            # Arrow indicator on Y-axis is the only Spot marker
             ticktext=[f"➔ <b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs],
             tickfont=dict(size=12)
         )
@@ -151,11 +151,11 @@ def render_gamma_bar(df, S):
     strikes = agg.index.tolist()
     gex_vals = agg.values
 
-    # Find Gamma Flip
+    # Detect Gamma Flip
     flip_strike = None
     for i in range(len(gex_vals)-1):
         if np.sign(gex_vals[i]) != np.sign(gex_vals[i+1]):
-            flip_strike = strikes[i]
+            flip_strike = (strikes[i] + strikes[i+1]) / 2
             break
 
     fig = go.Figure()
@@ -165,14 +165,17 @@ def render_gamma_bar(df, S):
         name="Net GEX"
     ))
 
+    # Keep structural Flip line for market context
     if flip_strike:
-        fig.add_vline(x=flip_strike, line_dash="dash", line_color="white", annotation_text="Flip")
-    fig.add_vline(x=S, line_color="cyan", annotation_text="Spot")
+        fig.add_vline(x=flip_strike, line_dash="dash", line_color="white", 
+                     annotation_text="Flip", annotation_position="top left")
 
     fig.update_layout(
-        title="Total Net GEX by Strike (Structural Walls)",
-        template="plotly_dark", height=400, font=dict(family="Arial"),
-        xaxis=dict(title="Strike"), yaxis=dict(title="Net GEX ($)")
+        title="Structural Gamma Walls (Total GEX by Strike)",
+        template="plotly_dark", height=450, font=dict(family="Arial"),
+        xaxis=dict(title="Strike Price", gridcolor='rgba(255,255,255,0.1)'),
+        yaxis=dict(title="Total Net GEX ($)", gridcolor='rgba(255,255,255,0.1)'),
+        margin=dict(l=80, r=40, t=80, b=40)
     )
     return fig
 
@@ -182,15 +185,13 @@ def render_gamma_bar(df, S):
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX Pro Analytics</h2>", unsafe_allow_html=True)
     
-    # Use vertical_alignment="bottom" to keep Run button aligned with input fields
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8], vertical_alignment="bottom")
     
     ticker = c1.text_input("Ticker", value="SPX").upper().strip()
     max_exp = c2.number_input("Expiries", 1, 15, 6)
     s_range = c3.number_input("Strike ±", 5, 500, 80 if ticker == "SPX" else 25)
     
-    # Renamed to "Run"
-    run = c4.button("Run", type="primary", use_container_width=True)
+    run = c4.button("Run", type="primary", width="stretch")
 
     if run:
         S, raw_df = fetch_data(ticker, int(max_exp))
@@ -208,10 +209,9 @@ def main():
                 cp_ratio = (df[df['type']=='call']['oi'].sum() / puts_sum) if puts_sum > 0 else 0
                 m5.metric("C/P Ratio", f"{cp_ratio:.2f}")
                 
-                # Matrix
-                st.plotly_chart(render_heatmap(df, ticker, S), use_container_width=True)
-                # Bar Chart
-                st.plotly_chart(render_gamma_bar(df, S), use_container_width=True)
+                # Visuals with updated stretch width
+                st.plotly_chart(render_heatmap(df, ticker, S), width="stretch")
+                st.plotly_chart(render_gamma_bar(df, S), width="stretch")
             else: st.warning("No data found.")
 
 if __name__ == "__main__":
