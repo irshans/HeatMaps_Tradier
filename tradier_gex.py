@@ -150,26 +150,21 @@ def render_gamma_bar(df, S):
     agg = df.groupby('strike')['gex'].sum().sort_index()
     strikes = agg.index.tolist()
     gex_vals = agg.values
-
     # Detect Gamma Flip
     flip_strike = None
     for i in range(len(gex_vals)-1):
         if np.sign(gex_vals[i]) != np.sign(gex_vals[i+1]):
             flip_strike = (strikes[i] + strikes[i+1]) / 2
             break
-
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=strikes, y=gex_vals,
         marker_color=['#F1F50C' if v > 0 else '#56117a' for v in gex_vals],
         name="Net GEX"
     ))
-
-    # Keep structural Flip line for market context
     if flip_strike:
-        fig.add_vline(x=flip_strike, line_dash="dash", line_color="white", 
-                     annotation_text="Flip", annotation_position="top left")
-
+        fig.add_vline(x=flip_strike, line_dash="dash", line_color="white",
+                      annotation_text="Flip", annotation_position="top left")
     fig.update_layout(
         title="Structural Gamma Walls (Total GEX by Strike)",
         template="plotly_dark", height=450, font=dict(family="Arial"),
