@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import requests
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="GEX Pro 2025", page_icon="📊", layout="wide")
@@ -17,6 +18,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# --- API TOKEN ---
 if "TRADIER_TOKEN" in st.secrets:
     TRADIER_TOKEN = st.secrets["TRADIER_TOKEN"]
 else:
@@ -70,6 +72,7 @@ def fetch_data(ticker, max_exp):
     if not quote_data or 'quotes' not in quote_data:
         st.error("Failed to fetch quote.")
         return None, None
+
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
 
@@ -81,6 +84,7 @@ def fetch_data(ticker, max_exp):
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list):
         all_exps = [all_exps]
+
     valid_exps = [exp for exp in all_exps if exp in open_days][:max_exp]
 
     if not valid_exps:
@@ -155,7 +159,7 @@ def render_heatmap(df, ticker, S):
             val = z_raw[i, j]
             if abs(val) < 500:
                 continue
-            star = " ★" if abs(val) == abs_limit and abs_limit > 0 else ""
+            star = " ★" if np.isclose(abs(val), abs_limit) else ""
             label = f"${val/1e3:,.0f}K{star}"
             t_color = "black" if val >= 0 else "white"
             fig.add_annotation(
@@ -164,8 +168,6 @@ def render_heatmap(df, ticker, S):
             )
 
     calc_height = max(600, len(y_labs) * 25)
-
-    # Spot strike highlighted with arrow + bold
     ticktext = [f"➔ <b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs]
 
     fig.update_layout(
@@ -195,11 +197,10 @@ def render_gamma_bar(df, S):
     strikes = agg.index.tolist()
     gex_vals = agg.values
 
-    # Gamma Flip detection
     flip_strike = None
     for i in range(len(gex_vals) - 1):
-        if np.sign(gex_vals[i]) != np.sign(gex_vals[i + 1]) and gex_vals[i] != 0 and gex_vals[i + 1] != 0:
-            flip_strike = (strikes[i] + strikes[i + 1]) / 2
+        if gex_vals[i] * gex_vals[i + 1] < 0:
+            flip_strike = np.interp(0, [gex_vals[i], gex_vals[i+1]], [strikes[i], strikes[i+1]])
             break
 
     fig = go.Figure()
@@ -227,7 +228,7 @@ def render_gamma_bar(df, S):
         bargap=0.2
     )
 
-    return fig  # ← Critical: now returns the figure!
+    return fig
 
 # -------------------------
 # Main App
@@ -235,6 +236,28 @@ def render_gamma_bar(df, S):
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX Pro Analytics</h2>", unsafe_allow_html=True)
 
+    # --- Auto-refresh controls ---
+    refresh_col1, refresh_col2, refresh_col3 = st.columns([1, 1, 2])
+    auto_refresh = refresh_col1.toggle("Auto‑Refresh", value=False)
+    refresh_interval = 60  # seconds
+
+    if auto_refresh:
+        st_autorefresh(interval=refresh_interval * 1000, key="gex_refresh")
+
+        # Countdown timer
+        if "countdown" not in st.session_state:
+            st.session_state.countdown = refresh_interval
+
+        st.session_state.countdown -= 1
+        if st.session_state.countdown <= 0:
+            st.session_state.countdown = refresh_interval
+
+        refresh_col2.write(f"⏳ Refreshing in **{st.session_state.countdown}s**")
+
+    # Last updated timestamp
+    refresh_col3.write(f"🕒 Last updated: **{datetime.now().strftime('%H:%M:%S')}**")
+
+    # --- Inputs ---
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8], vertical_alignment="bottom")
 
     ticker = c1.text_input("Ticker", value="SPX").upper().strip()
@@ -242,7 +265,7 @@ def main():
     s_range = c3.number_input("Strike ±", min_value=5, max_value=500, value=80 if ticker == "SPX" else 25)
     run = c4.button("Run", type="primary")
 
-    if run:
+    if run or auto_refresh:
         with st.spinner("Fetching data from Tradier..."):
             S, raw_df = fetch_data(ticker, int(max_exp))
 
