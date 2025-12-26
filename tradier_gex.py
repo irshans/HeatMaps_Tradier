@@ -117,33 +117,46 @@ def fetch_data(ticker, max_exp):
     if open_days:
         sorted_days = sorted(list(open_days))
         st.write(f"DEBUG: Market calendar has {len(open_days)} open days from {sorted_days[0]} to {sorted_days[-1]}")
+    else:
+        st.write("DEBUG: No open_days returned from calendar!")
     
     quote_data = tradier_get("markets/quotes", {"symbols": ticker})
-    if not quote_data: 
+    if not quote_data:
+        st.write("DEBUG: Quote fetch failed")
         return None, None
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
+    st.write(f"DEBUG: Got spot price: ${S}")
 
     exp_data = tradier_get("markets/options/expirations", {"symbol": ticker, "includeAllRoots": "true"})
-    if not exp_data: 
+    if not exp_data:
+        st.write("DEBUG: Expirations fetch failed")
         return S, None
+    
+    st.write(f"DEBUG: Raw exp_data keys: {exp_data.keys()}")
+    
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): 
         all_exps = [all_exps]
     
     # Debug: Show first 10 expirations from API
     st.write(f"DEBUG: First 10 expirations from API: {all_exps[:10]}")
+    st.write(f"DEBUG: Total expirations available: {len(all_exps)}")
     
     # Take first max_exp, then filter to only open days to ensure chronological order
     valid_exps = []
-    for exp in all_exps:
+    skipped = []
+    for i, exp in enumerate(all_exps):
         if exp in open_days:
             valid_exps.append(exp)
         else:
-            st.write(f"DEBUG: Skipping {exp} - not in open_days")
+            skipped.append(exp)
         if len(valid_exps) >= max_exp:
+            st.write(f"DEBUG: Stopped after checking {i+1} expirations")
             break
     
+    if skipped:
+        st.write(f"DEBUG: Skipped {len(skipped)} dates: {skipped[:5]}")
     st.write(f"DEBUG: Selected {len(valid_exps)} expirations: {valid_exps}")
     
     dfs = []
