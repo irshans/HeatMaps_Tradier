@@ -8,13 +8,15 @@ from datetime import datetime
 # --- APP CONFIG ---
 st.set_page_config(page_title="GEX Pro 2025", page_icon="📊", layout="wide")
 
+# Force Arial globally via CSS
 st.markdown("""
     <style>
+    * { font-family: 'Arial', sans-serif !important; }
     .block-container { padding-top: 24px; padding-bottom: 8px; }
     button[kind="primary"], .stButton>button { padding:4px 8px !important; font-size:12px !important; height:30px !important; }
     input[type="text"], input[type="number"], select { padding:6px 8px !important; font-size:12px !important; height:28px !important; }
-    [data-testid="stMetricValue"] { font-size: 22px !important; }
-    h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; }
+    [data-testid="stMetricValue"] { font-size: 22px !important; font-family: 'Arial' !important; }
+    h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -74,7 +76,7 @@ def fetch_data(ticker, max_exp):
     valid_exps = [exp for exp in all_exps if exp in open_days][:max_exp]
     
     dfs = []
-    prog = st.progress(0, text="Fetching Greeks...")
+    prog = st.progress(0, text="Reading Option Chains...")
     for i, exp in enumerate(valid_exps):
         chain = tradier_get("markets/options/chains", {"symbol": ticker, "expiration": exp, "greeks": "true"})
         if chain and 'options' in chain and chain['options']:
@@ -95,8 +97,6 @@ def process_exposure(df, S, s_range):
         if not g: continue
         gamma, vega = float(g.get('gamma', 0) or 0), float(g.get('vega', 0) or 0)
         oi, op_type = int(row.get('open_interest', 0) or 0), row['option_type'].lower()
-        
-        # side: Call = +1 (Dealer Long), Put = -1 (Dealer Short)
         side = 1 if op_type == 'call' else -1
         
         res.append({
@@ -114,14 +114,12 @@ def render_heatmap(df, ticker, S):
     pivot = df.pivot_table(index='strike', columns='expiry', values='gex', aggfunc='sum').sort_index(ascending=False).fillna(0)
     z_raw = pivot.values
     x_labs, y_labs = pivot.columns.tolist(), pivot.index.tolist()
-    
-    # Global absolute max for the Star and Scaling
     abs_limit = np.max(np.abs(z_raw)) if z_raw.size else 1.0
     
     fig = go.Figure(data=go.Heatmap(
         z=z_raw, x=x_labs, y=y_labs, 
         colorscale=CUSTOM_COLORSCALE, zmin=-abs_limit, zmax=abs_limit, zmid=0,
-        colorbar=dict(title="GEX ($)", tickformat="$.2s")
+        colorbar=dict(title="GEX ($)", tickfont=dict(family="Arial"))
     ))
 
     # Cell Annotations
@@ -129,36 +127,31 @@ def render_heatmap(df, ticker, S):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
-            
-            # Star logic: Add star only to the single highest absolute GEX cell
             star = " ★" if abs(val) == abs_limit and abs_limit > 0 else ""
             label = f"${val/1e3:,.0f}K{star}"
-            
-            # Contrast logic for font: 
-            # If positive (Yellow/Green/Teal), use black text. 
-            # If negative (Purple), use white text.
             t_color = "black" if val >= 0 else "white"
-            
             fig.add_annotation(
                 x=exp, y=strike, text=label, showarrow=False,
-                font=dict(color=t_color, size=12, family="Arial Black")
+                font=dict(color=t_color, size=12, family="Arial")
             )
 
-    # Dynamic Height Calculation: 25 pixels per strike row
+    # Highlight Spot Strike
+    closest_strike = min(y_labs, key=lambda x: abs(x - S))
+    fig.add_shape(type="rect", xref="paper", yref="y", x0=0, x1=1,
+                  y0=closest_strike - 2, y1=closest_strike + 2,
+                  line=dict(color="rgba(255, 255, 255, 0.5)", width=2), fillcolor="rgba(255,255,255,0.1)")
+
     calc_height = max(600, len(y_labs) * 25)
 
     fig.update_layout(
         title=f"{ticker} GEX Matrix | Spot: ${S:,.2f}", 
-        template="plotly_dark", height=calc_height,
+        template="plotly_dark", height=calc_height, font=dict(family="Arial"),
         xaxis=dict(type='category', side='top', tickfont=dict(size=12)),
         yaxis=dict(
-            title="Strike",
-            tickmode='array',
-            tickvals=y_labs,
-            ticktext=[f"<b>{s:,.0f}</b>" if abs(s-S) < 2 else f"{s:,.0f}" for s in y_labs],
+            title="Strike", tickmode='array', tickvals=y_labs,
+            ticktext=[f"<b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs],
             tickfont=dict(size=12)
-        ),
-        margin=dict(l=80, r=40, t=100, b=40)
+        )
     )
     return fig
 
@@ -168,10 +161,18 @@ def render_heatmap(df, ticker, S):
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX Pro Analytics</h2>", unsafe_allow_html=True)
     
+    # Dynamic Strike Logic
+    if "ticker_input" not in st.session_state:
+        st.session_state.ticker_input = "SPX"
+    
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8])
-    ticker = c1.text_input("Ticker", "SPX").upper().strip()
+    ticker = c1.text_input("Ticker", value=st.session_state.ticker_input).upper().strip()
+    
+    # Update default range based on ticker
+    default_range = 80 if ticker == "SPX" else 25
+    
     max_exp = c2.number_input("Expiries", 1, 15, 6)
-    s_range = c3.number_input("Strike ±", 10, 500, 80)
+    s_range = c3.number_input("Strike ±", 5, 500, default_range)
     run = c4.button("Run Sync", type="primary")
 
     if run:
@@ -179,7 +180,6 @@ def main():
         if S and raw_df is not None:
             df = process_exposure(raw_df, S, s_range)
             if not df.empty:
-                # --- METRICS HEADER ---
                 net_gex = df["gex"].sum() / 1e9
                 net_vex = df["vex"].sum() / 1e6
                 calls = df[df["type"] == "call"]["oi"].sum()
@@ -194,7 +194,7 @@ def main():
                 m5.metric("Call/Put Ratio", f"{cp_ratio:.2f}")
                 
                 st.plotly_chart(render_heatmap(df, ticker, S), use_container_width=True)
-            else: st.warning("No data found in strike range.")
+            else: st.warning("No data found in range.")
         else: st.error("Fetch failed.")
 
 if __name__ == "__main__":
