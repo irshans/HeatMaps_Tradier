@@ -39,41 +39,58 @@ def tradier_get(endpoint, params):
 
 @st.cache_data(ttl=3600)
 def get_open_market_days():
-    """Fetches the market calendar to identify only 'open' trading days."""
+    """Builds a strict whitelist of dates where market status is 'open'."""
+    # Fetch current month and next month to cover all 'max_exp' ranges
     cal_data = tradier_get("markets/calendar", {})
     open_days = set()
     try:
         if cal_data and 'calendar' in cal_data:
             days = cal_data['calendar']['days']['day']
+            # Tradier returns a list of dicts for the days
             if isinstance(days, dict): days = [days]
             for d in days:
-                if d['status'] == 'open':
-                    open_days.add(d['date'])
+                if d.get('status') == 'open':
+                    open_days.add(d.get('date'))
     except: pass
     return open_days
 
-def fetch_tradier_data(ticker, max_exp):
-    # 1. Get Market Calendar
-    open_days = get_open_market_days()
+def is_actually_trading_day(date_str, open_whitelist):
+    """Failsafe: Checks whitelist AND ensures it's not a weekend."""
+    try:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        # 1. Weekday check (0=Mon, 4=Fri)
+        if dt.weekday() > 4: 
+            return False
+        # 2. Whitelist check (if whitelist fetch succeeded)
+        if open_whitelist and date_str not in open_whitelist:
+            return False
+        return True
+    except:
+        return False
 
-    # 2. Get Spot Price
+def fetch_tradier_data(ticker, max_exp):
+    open_days = get_open_market_days()
+    
+    # 1. Get Spot Price
     quote_data = tradier_get("markets/quotes", {"symbols": ticker})
     if not quote_data or 'quotes' not in quote_data: return None, None
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
 
-    # 3. Get Expirations
+    # 2. Get Expirations
     exp_data = tradier_get("markets/options/expirations", {"symbol": ticker, "includeAllRoots": "true"})
-    if not exp_data: return S, None
+    if not exp_data or 'expirations' not in exp_data or not exp_data['expirations']: 
+        return S, None
+    
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): all_exps = [all_exps]
     
-    # 4. Filter: Only fetch dates that are in the 'open' market calendar
-    valid_exps = [d for d in all_exps if d in open_days]
+    # 3. Apply Strict Filtering
+    valid_exps = [d for d in all_exps if is_actually_trading_day(d, open_days)]
     target_exps = valid_exps[:max_exp]
     
     dfs = []
-    prog = st.progress(0, text="Fetching Market-Open Expirations...")
+    prog = st.progress(0, text="Syncing Trading Days...")
     for i, exp in enumerate(target_exps):
         chain = tradier_get("markets/options/chains", {"symbol": ticker, "expiration": exp, "greeks": "true"})
         if chain and 'options' in chain and chain['options']:
@@ -83,6 +100,9 @@ def fetch_tradier_data(ticker, max_exp):
     prog.empty()
     return S, pd.concat(dfs) if dfs else None
 
+# -------------------------
+# Processing & Plots
+# -------------------------
 def process_exposure(df, S, s_range):
     if df is None or df.empty: return pd.DataFrame()
     df = df[(df["strike"] >= S - s_range) & (df["strike"] <= S + s_range)].copy()
@@ -91,6 +111,7 @@ def process_exposure(df, S, s_range):
         g = row.get('greeks')
         if not g or not isinstance(g, dict): continue
         gamma, vanna, oi = float(g.get('gamma', 0) or 0), float(g.get('vanna', 0) or 0), int(row.get('open_interest', 0) or 0)
+        # Fixed Dealer Model: Short Calls (-), Long Puts (+)
         dealer_pos = -1 if row['option_type'].lower() == 'call' else 1
         res.append({
             "strike": row['strike'], "expiry": row['expiration_date'],
@@ -99,9 +120,6 @@ def process_exposure(df, S, s_range):
         })
     return pd.DataFrame(res)
 
-# -------------------------
-# Visualizations
-# -------------------------
 def render_plots(df, ticker, S, mode):
     if df.empty: return None, None
     val_col = mode.lower()
@@ -117,20 +135,18 @@ def render_plots(df, ticker, S, mode):
         colorbar=dict(title=f"{mode} ($)")
     ))
 
-    # Conditional Annotations: Black for Pos, White for Neg
+    # Text Color Logic: Positive = Black, Negative = White
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
             font_color = "black" if val >= 0 else "white"
             fig_h.add_annotation(
-                x=exp, y=strike,
-                text=f"${abs(val)/1e3:,.0f}K",
-                showarrow=False,
-                font=dict(color=font_color, size=10, family="Arial Black")
+                x=exp, y=strike, text=f"${abs(val)/1e3:,.0f}K",
+                showarrow=False, font=dict(color=font_color, size=10, family="Arial Black")
             )
 
-    fig_h.update_layout(title=f"{ticker} {mode} Live | Spot: ${S:,.2f}", template="plotly_dark", height=850)
+    fig_h.update_layout(title=f"{ticker} {mode} | Spot: ${S:,.2f}", template="plotly_dark", height=850)
     fig_b = go.Figure(go.Bar(x=agg.index, y=agg.values, marker_color=['#2563eb' if v < 0 else '#fbbf24' for v in agg.values]))
     fig_b.update_layout(title=f"Net {mode} by Strike", template="plotly_dark", height=350)
     return fig_h, fig_b
@@ -140,11 +156,11 @@ def render_plots(df, ticker, S, mode):
 # -------------------------
 def main():
     st.markdown("<div style='text-align:center;'><h2 style='font-size:18px;'>📊 GEX / VEX Pro (Tradier Live)</h2></div>", unsafe_allow_html=True)
-    c1, col_metric, c3, c4, c5 = st.columns([1.5, 1, 0.8, 1, 0.8])
+    c1, c2, c3, c4, c5 = st.columns([1.5, 1, 0.8, 1, 0.8])
     with c1: ticker = st.text_input("Ticker", "SPY").upper().strip()
-    with col_metric: mode = st.radio("Metric", ["GEX", "VEX"], horizontal=True)
+    with c2: mode = st.radio("Metric", ["GEX", "VEX"], horizontal=True)
     with c3: max_exp = st.number_input("Expiries", 1, 15, 6)
-    with c4: s_range = st.number_input("Strike ±", 5, 500, 30)
+    with c4: s_range = st.number_input("Strike ±", 5, 1000, 30)
     with c5: run = st.button("Run", type="primary")
 
     if run:
@@ -157,8 +173,8 @@ def main():
                 h_fig, b_fig = render_plots(processed, ticker, S, mode)
                 st.plotly_chart(h_fig, use_container_width=True)
                 st.plotly_chart(b_fig, use_container_width=True)
-            else: st.warning("No data found in this strike range.")
-        else: st.error("Fetch failed. Symbol may be invalid or market is closed.")
+            else: st.warning("No data in range.")
+        else: st.error("Fetch failed. Verify ticker or API limits.")
 
 if __name__ == "__main__":
     main()
