@@ -18,7 +18,7 @@ else:
         saved_token = ""
 
 # --- APP CONFIG ---
-st.set_page_config(page_title="GEX Live Pulse", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="GEX & VEX Pro Live", page_icon="⚡", layout="wide")
 
 BASE_URL = "https://api.tradier.com/v1/"
 CONTRACT_SIZE = 100
@@ -61,19 +61,42 @@ def process_exposure(df, S, s_range, model_type):
     for _, row in df.iterrows():
         greeks = row.get('greeks', {})
         if not greeks or greeks is None: continue
+        
         gamma = greeks.get('gamma', 0) or 0
-        delta = greeks.get('delta', 0) or 0
+        vanna = greeks.get('vanna', 0) or 0
         oi = row.get('open_interest', 0) or 0
+        
         if model_type == "Dealer Short All":
             gex = -gamma * S**2 * 0.01 * CONTRACT_SIZE * oi
+            vex = -vanna * CONTRACT_SIZE * oi 
         else:
             gex = (-gamma if row['option_type'] == 'call' else gamma) * S**2 * 0.01 * CONTRACT_SIZE * oi
-        dex = -delta * S * CONTRACT_SIZE * oi
-        res.append({"strike": row['strike'], "expiry": row['expiration_date'], "gex": gex, "dex": dex})
+            vex = (-vanna if row['option_type'] == 'call' else vanna) * CONTRACT_SIZE * oi
+
+        res.append({
+            "strike": row['strike'], 
+            "expiry": row['expiration_date'], 
+            "gex": gex, 
+            "vex": vex
+        })
     return pd.DataFrame(res)
 
+def calculate_gamma_flip(df):
+    """Simple linear interpolation to find where GEX crosses zero."""
+    agg = df.groupby('strike')['gex'].sum().sort_index()
+    strikes = agg.index.values
+    values = agg.values
+    for i in range(len(values) - 1):
+        if (values[i] < 0 and values[i+1] > 0) or (values[i] > 0 and values[i+1] < 0):
+            # Linear interpolation
+            low_s, high_s = strikes[i], strikes[i+1]
+            low_v, high_v = values[i], values[i+1]
+            flip = low_s - low_v * (high_s - low_s) / (high_v - low_v)
+            return flip
+    return None
+
 # -------------------------
-# Plotting
+# Visualizations
 # -------------------------
 def render_plots(df, ticker, S, mode):
     val_col = mode.lower()
@@ -102,7 +125,7 @@ def render_plots(df, ticker, S, mode):
 
     fig.update_layout(
         title=f"LIVE {ticker} {mode} | Spot: ${S:,.2f}",
-        template="plotly_dark", height=800, margin=dict(t=50, b=50),
+        template="plotly_dark", height=700, margin=dict(t=50, b=50),
         yaxis=dict(tickmode='array', tickvals=y_labs, 
                    ticktext=[f"<b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs])
     )
@@ -111,28 +134,29 @@ def render_plots(df, ticker, S, mode):
 # -------------------------
 # MAIN APP
 # -------------------------
-st.title("📊 GEX Pro Live")
+st.title("📊 GEX & VEX Pro Live")
 
-# TOP CONTROLS
-c1, c2, c3, c4, c5 = st.columns([1.5, 1, 1, 1, 1.5])
+if not saved_token:
+    api_token = st.text_input("Enter Tradier Token", type="password")
+else:
+    api_token = saved_token
+
+c1, c2, c3, c4 = st.columns([1, 1, 1, 1.5])
 with c1:
-    api_token = st.text_input("Tradier Token", value=saved_token, type="password")
-with c2:
     ticker = st.text_input("Ticker", "SPY").upper().strip()
+with c2:
+    mode = st.selectbox("Metric", ["GEX", "VEX"])
 with c3:
-    mode = st.selectbox("Metric", ["GEX", "DEX"])
+    max_exp = st.number_input("Expiries", 1, 10, 3)
 with c4:
-    max_exp = st.number_input("Expiries", 1, 10, 5)
-with c5:
-    model_type = st.selectbox("Model", ["Standard", "Dealer Short All"])
+    model_type = st.selectbox("Dealer Model", ["Standard", "Dealer Short All"])
 
 s_range = st.slider("Strike Range (± Spot)", 5, 200, 40)
 
-# LIVE REFRESH FRAGMENT
 @st.fragment(run_every="60s")
 def live_pulse():
     if not api_token:
-        st.info("Please enter a Tradier Token to begin.")
+        st.info("Set TRADIER_TOKEN in Secrets.")
         return
 
     S = fetch_market_data(ticker, api_token)
@@ -147,16 +171,29 @@ def live_pulse():
         processed = process_exposure(full_df, S, s_range, model_type)
         
         if not processed.empty:
+            # Main Charts
             net_val = processed[mode.lower()].sum() / 1e9
-            st.metric(f"Total Net {mode}", f"{'-' if net_val < 0 else ''}${abs(net_val):,.2f}B", 
-                      help="Updated automatically every 60 seconds")
+            st.metric(f"Total Net {mode}", f"{'-' if net_val < 0 else ''}${abs(net_val):,.2f}B")
+            st.plotly_chart(render_plots(processed, ticker, S, mode), use_container_width=True)
             
-            fig = render_plots(processed, ticker, S, mode)
-            st.plotly_chart(fig, use_container_width=True)
+            # --- WALL ANALYTICS ---
+            st.markdown("---")
+            st.subheader("🧱 Gamma Wall Analysis")
+            
+            agg_gex = processed.groupby('strike')['gex'].sum()
+            call_wall = agg_gex.idxmax()
+            put_wall = agg_gex.idxmin()
+            flip_price = calculate_gamma_flip(processed)
+            
+            w1, w2, w3 = st.columns(3)
+            w1.metric("Call Wall (Max +GEX)", f"${call_wall:,.0f}")
+            w2.metric("Put Wall (Max -GEX)", f"${put_wall:,.0f}")
+            w3.metric("Gamma Flip", f"${flip_price:,.2f}" if flip_price else "N/A")
+            
             st.caption(f"Last Sync: {datetime.now().strftime('%H:%M:%S')}")
         else:
             st.warning("No data in range.")
     else:
-        st.error("Connection failed. Verify Token and Ticker.")
+        st.error("Connection failed.")
 
 live_pulse()
