@@ -7,7 +7,7 @@ import requests
 # --- APP CONFIG ---
 st.set_page_config(page_title="GEX Pro 2025", page_icon="📊", layout="wide")
 
-# Compact UI styling
+# Compact UI styling (exactly from script 2)
 st.markdown(
     """
     <style>
@@ -40,7 +40,10 @@ st.markdown(
     }
 
     /* Reduce margins for columns */
-    .css-1lcbmhc.e1tzin5v0 { gap: 6px; }
+    .css-1lcbmhc.e1tzin5v0 { gap: 6px; } /* fallback: small column gap */
+    
+    /* Force header size reduction */
+    h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -55,14 +58,14 @@ else:
 BASE_URL = "https://api.tradier.com/v1/"
 CONTRACT_SIZE = 100
 
-# Updated color scheme with narrow neutral band
+# Exact color scheme from script 2
 CUSTOM_COLORSCALE = [
     [0.00, '#050018'],  # deepest purple (extreme negative)
     [0.10, '#260446'],
     [0.25, '#56117a'],
     [0.40, '#6E298A'],
     [0.49, '#783F8F'],  # last purple before center
-    [0.50, '#224B8B'],  # explicit center (neutral blue)
+    [0.50, '#224B8B'],  # explicit center (neutral blue) — separates neg/pos
     [0.52, '#32A7A7'],  # light teal (small positive)
     [0.65, '#39B481'],  # greenish
     [0.80, '#A8D42A'],  # yellow-green
@@ -158,25 +161,24 @@ def process_gex(df, S, s_range):
 def render_heatmap(df, ticker, S):
     pivot = df.pivot_table(index='strike', columns='expiry', values='gex', aggfunc='sum').sort_index(ascending=False).fillna(0)
     
-    z = pivot.values
-    x = [str(col) for col in pivot.columns]
-    y = pivot.index.tolist()
+    z_raw = pivot.values
+    # Scale for visual but use raw for color mapping
+    z_scaled = np.sign(z_raw) * (np.abs(z_raw) ** 0.5)
     
-    if not y:
+    x_labs = pivot.columns.tolist()
+    y_labs = pivot.index.tolist()
+    
+    if not y_labs:
         return None
     
-    # Symmetric range for proper color mapping
-    abs_max = np.max(np.abs(z)) if z.size else 1
+    closest_strike = min(y_labs, key=lambda x: abs(x - S))
     
-    # Find closest strike to spot
-    closest_strike = min(y, key=lambda x: abs(x - S))
-    
-    # Build hover text
+    # Build hover text using raw values
     h_text = []
-    for i, strike in enumerate(y):
+    for i, strike in enumerate(y_labs):
         row = []
-        for j, exp in enumerate(x):
-            val = z[i, j]
+        for j, exp in enumerate(x_labs):
+            val = z_raw[i, j]
             prefix = "-" if val < 0 else ""
             v_abs = abs(val)
             if v_abs >= 1e6:
@@ -188,65 +190,62 @@ def render_heatmap(df, ticker, S):
             row.append(f"Strike: ${strike:,.0f}<br>Expiry: {exp}<br>GEX: {formatted}")
         h_text.append(row)
     
+    # Symmetric range so zero maps to center exactly
+    max_abs = np.max(np.abs(z_raw)) if z_raw.size else 1.0
+    if max_abs == 0:
+        max_abs = 1.0
+    zmin = -max_abs
+    zmax = max_abs
+    
+    # Heatmap using raw z values
     fig = go.Figure(data=go.Heatmap(
-        z=z, x=x, y=y, text=h_text, hoverinfo="text",
-        colorscale=CUSTOM_COLORSCALE,
-        zmid=0, zmin=-abs_max, zmax=abs_max,
-        colorbar=dict(title="GEX ($)", tickformat="$,.2s")
+        z=z_raw, x=x_labs, y=y_labs, text=h_text, hoverinfo="text",
+        colorscale=CUSTOM_COLORSCALE, zmin=zmin, zmax=zmax, zmid=0, showscale=True,
+        colorbar=dict(title=dict(text="GEX ($)"), tickformat=",.0s")
     ))
 
-    # Annotations - show values above threshold
-    max_abs_val = np.max(np.abs(z)) if z.size else 0
-    for i, strike in enumerate(y):
-        for j, exp in enumerate(x):
-            val = z[i, j]
-            if abs(val) < 500: 
+    # Cell annotations (show only above threshold)
+    max_abs_val = np.max(np.abs(z_raw)) if z_raw.size else 0
+    for i, strike in enumerate(y_labs):
+        for j, exp in enumerate(x_labs):
+            val = z_raw[i, j]
+            if abs(val) < 500:
                 continue
-            
             prefix = "-" if val < 0 else ""
             txt = f"{prefix}${abs(val)/1e3:,.0f}K"
             if abs(val) == max_abs_val and max_abs_val > 0:
                 txt += " ⭐"
-            
-            # Text color based on value
-            text_color = "black" if val >= 0 else "white"
-            
-            fig.add_annotation(
-                x=exp, y=strike, 
-                text=txt, 
-                showarrow=False,
-                font=dict(color=text_color, size=12, family="Arial")
-            )
 
-    # Highlight spot strike
-    sorted_strikes = sorted(y)
+            # Use scaled z for text color determination
+            cell_val = z_scaled[i, j]
+            zmin_s = z_scaled.min() if z_scaled.size else -1
+            zmax_s = z_scaled.max() if z_scaled.size else 1
+            if zmax_s != zmin_s:
+                z_norm = (cell_val - zmin_s) / (zmax_s - zmin_s)
+            else:
+                z_norm = 0.5
+            text_color = "black" if z_norm > 0.55 else "white"
+
+            fig.add_annotation(x=exp, y=strike, text=txt, showarrow=False, 
+                             font=dict(color=text_color, size=12, family="Arial"), 
+                             xref="x", yref="y")
+
+    # Highlight background for spot strike
+    sorted_strikes = sorted(y_labs)
     strike_diffs = np.diff(sorted_strikes) if len(sorted_strikes) > 1 else np.array([sorted_strikes[0] * 0.05])
     padding = (strike_diffs[0] * 0.45) if len(strike_diffs) > 0 else 2.5
 
-    fig.add_shape(
-        type="rect", xref="paper", yref="y",
-        x0=-0.08, x1=1.0,
-        y0=closest_strike - padding,
-        y1=closest_strike + padding,
-        fillcolor="rgba(255, 51, 51, 0.25)",
-        line=dict(width=0),
-        layer="below"
-    )
+    fig.add_shape(type="rect", xref="paper", yref="y", x0=-0.08, x1=1.0, 
+                  y0=closest_strike - padding, y1=closest_strike + padding, 
+                  fillcolor="rgba(255, 51, 51, 0.25)", line=dict(width=0), layer="below")
 
     fig.update_layout(
-        title=f"{ticker} GEX Heatmap | Spot: ${S:,.2f} — Dealer: Short Calls / Long Puts",
-        height=900,
-        template="plotly_dark",
-        font=dict(family="Arial"),
-        xaxis=dict(type='category', title="Expiration Date", side='top', tickfont=dict(size=12)),
-        yaxis=dict(
-            title="Strike Price",
-            tickfont=dict(size=12),
-            autorange=True,
-            tickmode='array',
-            tickvals=y,
-            ticktext=[f"<b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y]
-        ),
+        title=f"{ticker} GEX Exposure Map | Spot: ${S:,.2f} — Dealer: Short Calls / Long Puts", 
+        template="plotly_dark", height=900, 
+        xaxis=dict(type='category', side='top', tickfont=dict(size=12)), 
+        yaxis=dict(title="Strike", tickfont=dict(size=12), autorange=True, 
+                   tickmode='array', tickvals=y_labs, 
+                   ticktext=[f"<b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs]), 
         margin=dict(l=80, r=60, t=100, b=40)
     )
     return fig
@@ -255,9 +254,9 @@ def render_heatmap(df, ticker, S):
 # Main App
 # -------------------------
 def main():
-    # Small centered title
+    # Small centered title (exact match to script 2)
     st.markdown(
-        "<div style='text-align:center; margin-top:6px;'><h2 style='font-size:18px; margin:10px 0 6px 0; font-weight:600;'>📊 GEX Pro (Tradier API)</h2></div>",
+        "<div style='text-align:center; margin-top:6px;'><h2 style='font-size:18px; margin:10px 0 6px 0; font-weight:600;'>📊 GEX Pro (Tradier)</h2></div>",
         unsafe_allow_html=True,
     )
     
@@ -279,7 +278,7 @@ def main():
         if S and raw_df is not None:
             processed = process_gex(raw_df, S, s_range)
             if not processed.empty:
-                # Display net GEX metric
+                # Display net GEX metric (no + sign for positive)
                 t_gex = processed["gex"].sum() / 1e9
                 p_g = "-" if t_gex < 0 else ""
                 st.metric("Net Dealer GEX", f"{p_g}${abs(t_gex):,.2f}B")
