@@ -7,7 +7,6 @@ import os
 from datetime import datetime
 
 # --- CREDENTIALS LOADING ---
-# Completely bypass token box if Secret exists
 if "TRADIER_TOKEN" in st.secrets and st.secrets["TRADIER_TOKEN"]:
     saved_token = st.secrets["TRADIER_TOKEN"]
     show_token_box = False
@@ -34,12 +33,12 @@ def get_tradier_data(endpoint, params, token):
 
 @st.cache_data(ttl=3600)
 def fetch_trading_calendar(token):
-    """Fetches real-time market calendar from Tradier."""
     data = get_tradier_data("markets/calendar", {}, token)
     open_dates = set()
     try:
         if data and 'calendar' in data:
             days = data['calendar']['days']['day']
+            if isinstance(days, dict): days = [days]
             for d in days:
                 if d['status'] == 'open': open_dates.add(d['date'])
     except: pass
@@ -57,6 +56,7 @@ def fetch_options_chain(ticker, expiry, token):
     data = get_tradier_data("markets/options/chains", params, token)
     if data and 'options' in data and data['options']:
         opts = data['options']['option']
+        if opts is None: return pd.DataFrame()
         return pd.DataFrame(opts) if isinstance(opts, list) else pd.DataFrame([opts])
     return pd.DataFrame()
 
@@ -69,16 +69,16 @@ def process_exposure(df, S, s_range):
     res = []
     for _, row in df.iterrows():
         g = row.get('greeks', {})
-        if not g: continue
+        if not g or not isinstance(g, dict): continue
         gamma, vanna, oi = (g.get('gamma', 0) or 0), (g.get('vanna', 0) or 0), (row.get('open_interest', 0) or 0)
         is_call = row['option_type'].lower() == 'call'
-        # Standard Dealer: Short Calls (-), Long Puts (+)
         gex = (-gamma if is_call else gamma) * S**2 * 0.01 * CONTRACT_SIZE * oi
         vex = (-vanna if is_call else vanna) * CONTRACT_SIZE * oi
         res.append({"strike": row['strike'], "expiry": row['expiration_date'], "gex": gex, "vex": vex})
     return pd.DataFrame(res)
 
 def calculate_gamma_flip(df):
+    if df.empty: return None
     agg = df.groupby('strike')['gex'].sum().sort_index()
     s, v = agg.index.values, agg.values
     for i in range(len(v) - 1):
@@ -115,8 +115,9 @@ if show_token_box:
 else:
     api_token = saved_token
 
-# Dynamic Default Strikes logic
-ticker_input = st.text_input("Ticker", "SPX").upper().strip()
+raw_ticker = st.text_input("Ticker", "SPX").upper().strip()
+# Handle common index ticker formats
+ticker_input = f"${raw_ticker}" if raw_ticker in ["SPX", "NDX", "RUT"] else raw_ticker
 default_range = 80 if "SPX" in ticker_input else 25
 
 c1, c2, c3 = st.columns([1, 1, 3])
@@ -127,7 +128,7 @@ with c3: s_range = st.slider("Strike Range (± Spot)", 5, 250, default_range)
 @st.fragment(run_every="60s")
 def live_pulse():
     if not api_token:
-        st.info("Please set TRADIER_TOKEN in Streamlit Secrets.")
+        st.info("Set TRADIER_TOKEN in Streamlit Secrets.")
         return
 
     open_dates = fetch_trading_calendar(api_token)
@@ -136,36 +137,46 @@ def live_pulse():
     
     if S and exp_data:
         prog_bar = st.progress(0, text="Fetching chains...")
-        raw_dates = exp_data['expirations']['date']
-        if not isinstance(raw_dates, list): raw_dates = [raw_dates]
-        
-        # Filter for Market-Open days only
-        valid_dates = [d for d in raw_dates if d in open_dates]
-        target_dates = valid_dates[:max_exp]
-        
-        all_chains = []
-        for i, d in enumerate(target_dates):
-            all_chains.append(fetch_options_chain(ticker_input, d, api_token))
-            prog_bar.progress((i + 1) / len(target_dates))
-        
-        prog_bar.empty()
-        full_df = pd.concat(all_chains)
-        processed = process_exposure(full_df, S, s_range)
-        
-        if not processed.empty:
-            net_val = processed[mode.lower()].sum() / 1e9
-            st.metric(f"Total Net {mode}", f"{'-' if net_val < 0 else ''}${abs(net_val):,.2f}B")
-            st.plotly_chart(render_plots(processed, ticker_input, S, mode), use_container_width=True)
+        try:
+            raw_dates = exp_data['expirations']['date']
+            if not isinstance(raw_dates, list): raw_dates = [raw_dates]
+            valid_dates = [d for d in raw_dates if d in open_dates]
+            target_dates = valid_dates[:max_exp]
             
-            st.markdown("---")
-            st.subheader("🧱 Gamma Wall Analysis")
-            agg_gex = processed.groupby('strike')['gex'].sum()
-            flip_price = calculate_gamma_flip(processed)
-            w1, w2, w3 = st.columns(3)
-            w1.metric("Call Wall", f"${agg_gex.idxmax():,.0f}")
-            w2.metric("Put Wall", f"${agg_gex.idxmin():,.0f}")
-            w3.metric("Gamma Flip", f"${flip_price:,.2f}" if flip_price else "N/A")
-            st.caption(f"Last Sync: {datetime.now().strftime('%H:%M:%S')}")
-    else: st.error("Connection failed. Check Ticker.")
+            all_chains = []
+            for i, d in enumerate(target_dates):
+                chain_df = fetch_options_chain(ticker_input, d, api_token)
+                if not chain_df.empty:
+                    all_chains.append(chain_df)
+                prog_bar.progress((i + 1) / len(target_dates))
+            
+            prog_bar.empty()
+            
+            # --- CONCAT SAFETY CHECK ---
+            if not all_chains:
+                st.warning(f"No active option data found for {ticker_input} on open trading days.")
+                return
+
+            full_df = pd.concat(all_chains)
+            processed = process_exposure(full_df, S, s_range)
+            
+            if not processed.empty:
+                net_val = processed[mode.lower()].sum() / 1e9
+                st.metric(f"Total Net {mode}", f"{'-' if net_val < 0 else ''}${abs(net_val):,.2f}B")
+                st.plotly_chart(render_plots(processed, ticker_input, S, mode), use_container_width=True)
+                
+                st.markdown("---")
+                st.subheader("🧱 Gamma Wall Analysis")
+                agg_gex = processed.groupby('strike')['gex'].sum()
+                flip_price = calculate_gamma_flip(processed)
+                w1, w2, w3 = st.columns(3)
+                w1.metric("Call Wall", f"${agg_gex.idxmax():,.0f}")
+                w2.metric("Put Wall", f"${agg_gex.idxmin():,.0f}")
+                w3.metric("Gamma Flip", f"${flip_price:,.2f}" if flip_price else "N/A")
+                st.caption(f"Last Sync: {datetime.now().strftime('%H:%M:%S')}")
+        except Exception as e:
+            st.error(f"Error processing data: {e}")
+            prog_bar.empty()
+    else: st.error(f"Could not find data for {ticker_input}. Ensure the ticker is correct.")
 
 live_pulse()
