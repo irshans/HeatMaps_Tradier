@@ -48,7 +48,8 @@ def tradier_get(endpoint, params):
 @st.cache_data(ttl=3600)
 def get_market_days():
     open_days = set()
-    for year in [2025, 2026]:
+    current_year = datetime.now().year
+    for year in [current_year, current_year + 1]:
         for month in range(1, 13):
             cal = tradier_get("markets/calendar", {"month": month, "year": year})
             try:
@@ -114,12 +115,13 @@ def render_heatmap(df, ticker, S):
     z_raw = pivot.values
     x_labs, y_labs = pivot.columns.tolist(), pivot.index.tolist()
     
-    abs_max = np.max(np.abs(z_raw)) if z_raw.size else 1.0
+    # Global absolute max for the Star and Scaling
+    abs_limit = np.max(np.abs(z_raw)) if z_raw.size else 1.0
     
     fig = go.Figure(data=go.Heatmap(
         z=z_raw, x=x_labs, y=y_labs, 
-        colorscale=CUSTOM_COLORSCALE, zmin=-abs_max, zmax=abs_max, zmid=0,
-        colorbar=dict(title="GEX ($)")
+        colorscale=CUSTOM_COLORSCALE, zmin=-abs_limit, zmax=abs_limit, zmid=0,
+        colorbar=dict(title="GEX ($)", tickformat="$.2s")
     ))
 
     # Cell Annotations
@@ -127,23 +129,34 @@ def render_heatmap(df, ticker, S):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
-            label = f"${val/1e3:,.0f}K"
+            
+            # Star logic: Add star only to the single highest absolute GEX cell
+            star = " ★" if abs(val) == abs_limit and abs_limit > 0 else ""
+            label = f"${val/1e3:,.0f}K{star}"
+            
+            # Contrast logic for font: 
+            # If positive (Yellow/Green/Teal), use black text. 
+            # If negative (Purple), use white text.
             t_color = "black" if val >= 0 else "white"
-            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False,
-                               font=dict(color=t_color, size=10, family="Arial"))
+            
+            fig.add_annotation(
+                x=exp, y=strike, text=label, showarrow=False,
+                font=dict(color=t_color, size=12, family="Arial Black")
+            )
 
-    # Dynamic Height Calculation: ~22 pixels per strike row
-    calc_height = max(600, len(y_labs) * 22)
+    # Dynamic Height Calculation: 25 pixels per strike row
+    calc_height = max(600, len(y_labs) * 25)
 
     fig.update_layout(
-        title=f"{ticker} GEX Heatmap | Spot: ${S:,.2f}", 
+        title=f"{ticker} GEX Matrix | Spot: ${S:,.2f}", 
         template="plotly_dark", height=calc_height,
-        xaxis=dict(type='category', side='top'),
+        xaxis=dict(type='category', side='top', tickfont=dict(size=12)),
         yaxis=dict(
             title="Strike",
             tickmode='array',
             tickvals=y_labs,
-            ticktext=[f"{s:,.0f}" for s in y_labs]
+            ticktext=[f"<b>{s:,.0f}</b>" if abs(s-S) < 2 else f"{s:,.0f}" for s in y_labs],
+            tickfont=dict(size=12)
         ),
         margin=dict(l=80, r=40, t=100, b=40)
     )
@@ -153,11 +166,11 @@ def render_heatmap(df, ticker, S):
 # Main Execution
 # -------------------------
 def main():
-    st.markdown("<h2 style='text-align:center;'>📊 Professional GEX Analytics</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;'>📊 GEX Pro Analytics</h2>", unsafe_allow_html=True)
     
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8])
     ticker = c1.text_input("Ticker", "SPX").upper().strip()
-    max_exp = c2.number_input("Expiries", 1, 15, 5)
+    max_exp = c2.number_input("Expiries", 1, 15, 6)
     s_range = c3.number_input("Strike ±", 10, 500, 80)
     run = c4.button("Run Sync", type="primary")
 
@@ -181,7 +194,7 @@ def main():
                 m5.metric("Call/Put Ratio", f"{cp_ratio:.2f}")
                 
                 st.plotly_chart(render_heatmap(df, ticker, S), use_container_width=True)
-            else: st.warning("No data found.")
+            else: st.warning("No data found in strike range.")
         else: st.error("Fetch failed.")
 
 if __name__ == "__main__":
