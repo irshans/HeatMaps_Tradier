@@ -88,25 +88,28 @@ def tradier_get(endpoint, params):
 
 @st.cache_data(ttl=3600)
 def get_market_days():
-    """Fetch market calendar for current and next year to cover all expirations"""
+    """Fetch market calendar for current and next year, month by month"""
     from datetime import datetime
     open_days = set()
     
     current_year = datetime.now().year
-    years_to_fetch = [current_year, current_year + 1]
+    current_month = datetime.now().month
     
-    for year in years_to_fetch:
-        cal = tradier_get("markets/calendar", {"year": year})
-        try:
-            if cal and 'calendar' in cal and 'days' in cal['calendar']:
-                days = cal['calendar']['days']['day']
-                if isinstance(days, dict): 
-                    days = [days]
-                for d in days:
-                    if d.get('status') == 'open': 
-                        open_days.add(d.get('date'))
-        except: 
-            pass
+    # Fetch remaining months of current year + all of next year
+    for year in [current_year, current_year + 1]:
+        start_month = current_month if year == current_year else 1
+        for month in range(start_month, 13):
+            cal = tradier_get("markets/calendar", {"month": month, "year": year})
+            try:
+                if cal and 'calendar' in cal and 'days' in cal['calendar']:
+                    days = cal['calendar']['days']['day']
+                    if isinstance(days, dict): 
+                        days = [days]
+                    for d in days:
+                        if d.get('status') == 'open': 
+                            open_days.add(d.get('date'))
+            except: 
+                pass
     
     return open_days
 
