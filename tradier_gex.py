@@ -18,7 +18,7 @@ BASE_URL = "https://api.tradier.com/v1/"
 CONTRACT_SIZE = 100
 
 # -------------------------
-# Tradier API Functions
+# API Functions
 # -------------------------
 def tradier_get(endpoint, params):
     headers = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
@@ -54,23 +54,21 @@ def fetch_tradier_data(ticker, max_exp):
     
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): all_exps = [all_exps]
-    
-    valid_exps = [d for d in all_exps if d in open_days]
-    target_exps = valid_exps[:max_exp]
+    valid_exps = [d for d in all_exps if d in open_days][:max_exp]
     
     dfs = []
     prog = st.progress(0)
-    for i, exp in enumerate(target_exps):
+    for i, exp in enumerate(valid_exps):
         chain = tradier_get("markets/options/chains", {"symbol": ticker, "expiration": exp, "greeks": "true"})
         if chain and 'options' in chain and chain['options']:
             opts = chain['options']['option']
             dfs.append(pd.DataFrame(opts) if isinstance(opts, list) else pd.DataFrame([opts]))
-        prog.progress((i+1)/len(target_exps))
+        prog.progress((i+1)/len(valid_exps))
     prog.empty()
     return S, pd.concat(dfs) if dfs else None
 
 # -------------------------
-# GEX LOGIC (Sign Correction)
+# Processing & Viz
 # -------------------------
 def process_exposure(df, S, s_range):
     if df is None or df.empty: return pd.DataFrame()
@@ -79,13 +77,13 @@ def process_exposure(df, S, s_range):
     for _, row in df.iterrows():
         g = row.get('greeks')
         if not g or not isinstance(g, dict): continue
-        
         gamma = float(g.get('gamma', 0) or 0)
         vanna = float(g.get('vanna', 0) or 0)
         oi = int(row.get('open_interest', 0) or 0)
         
-        # CORRECT GEX SIGN CONVENTION:
-        # Calls: Dealer is Long (+) | Puts: Dealer is Short (-)
+        # SIGN CONVENTION:
+        # Calls (Public sells to Dealer) -> Dealer Long (+)
+        # Puts (Public buys from Dealer) -> Dealer Short (-)
         dealer_pos = 1 if row['option_type'].lower() == 'call' else -1
         
         res.append({
@@ -97,53 +95,60 @@ def process_exposure(df, S, s_range):
     return pd.DataFrame(res)
 
 def render_plots(df, ticker, S, mode):
-    if df.empty: return None, None
     val_col = mode.lower()
     agg = df.groupby('strike')[val_col].sum().sort_index()
-    
     pivot = df.pivot_table(index='strike', columns='expiry', values=val_col, aggfunc='sum', fill_value=0).sort_index(ascending=False)
+    
     z_raw = pivot.values
     x_labs = [str(x) for x in pivot.columns.tolist()]
     y_labs = pivot.index.tolist()
     
-    # Calculate Max Absolute for the Star
-    max_abs_val = np.max(np.abs(z_raw)) if z_raw.size else 0
-    max_abs_indices = np.where(np.abs(z_raw) == max_abs_val) if max_abs_val > 0 else ([], [])
+    # Color scale limits (Symmetric)
+    limit = np.max(np.abs(z_raw)) if z_raw.size else 1
     
     fig_h = go.Figure(data=go.Heatmap(
         z=z_raw, x=x_labs, y=y_labs, 
-        colorscale='Viridis', zmid=0, zmin=-max_abs_val, zmax=max_abs_val,
+        colorscale='RdBu', # Red-Blue is great for Pos/Neg balance
+        zmid=0, zmin=-limit, zmax=limit,
         colorbar=dict(title=f"{mode} ($)")
     ))
 
+    # Identify the "Star" cell
+    max_abs_val = np.max(np.abs(z_raw)) if z_raw.size else 0
+    
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
             
-            is_max = (i == max_abs_indices[0][0] and j == max_abs_indices[1][0])
-            star = " ★" if is_max else ""
+            # Use original value for label, only use abs for the star check
+            star = " ★" if abs(val) == max_abs_val and max_abs_val > 0 else ""
+            font_color = "black" if abs(val) < (limit * 0.4) else "white"
             
-            font_color = "black" if val >= 0 else "white"
             fig_h.add_annotation(
-                x=exp, y=strike, text=f"${abs(val)/1e3:,.0f}K{star}",
+                x=exp, y=strike, 
+                text=f"${val/1e3:,.0f}K{star}", # val/1e3 keeps the sign!
                 showarrow=False, font=dict(color=font_color, size=10, family="Arial")
             )
 
     fig_h.update_layout(
-        title=f"{ticker} {mode} | Spot: ${S:,.2f}", 
-        template="plotly_dark", height=850, font=dict(family="Arial"),
-        xaxis=dict(type='category', title="Expiration"),
-        yaxis=dict(title="Strike")
+        title=f"{ticker} {mode} | Spot: ${S:,.2f}", template="plotly_dark", height=850,
+        font=dict(family="Arial"),
+        xaxis=dict(type='category', title="Expiration Date"),
+        yaxis=dict(title="Strike Price")
     )
 
-    fig_b = go.Figure(go.Bar(x=agg.index, y=agg.values, marker_color=['#ef4444' if v < 0 else '#10b981' for v in agg.values]))
+    # Bar chart with conditional colors
+    fig_b = go.Figure(go.Bar(
+        x=agg.index, y=agg.values, 
+        marker_color=['#ef4444' if v < 0 else '#10b981' for v in agg.values]
+    ))
     fig_b.update_layout(title=f"Net {mode} by Strike", template="plotly_dark", height=350, font=dict(family="Arial"))
     
     return fig_h, fig_b
 
 def main():
-    st.markdown("<div style='text-align:center;'><h2 style='font-family:Arial;'>📊 GEX / VEX Pro (Corrected Signs)</h2></div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align:center;'><h2 style='font-family:Arial;'>📊 GEX / VEX Pro (Live Tape)</h2></div>", unsafe_allow_html=True)
     ticker = st.text_input("Ticker", "SPX").upper().strip()
     c1, c2, c3, c4 = st.columns([1, 1, 1, 0.8])
     with c1: mode = st.radio("Metric", ["GEX", "VEX"], horizontal=True)
@@ -161,7 +166,7 @@ def main():
                 h_fig, b_fig = render_plots(processed, ticker, S, mode)
                 st.plotly_chart(h_fig, use_container_width=True)
                 st.plotly_chart(b_fig, use_container_width=True)
-            else: st.warning("No data in range.")
+            else: st.warning("No data found.")
         else: st.error("Fetch failed.")
 
 if __name__ == "__main__":
