@@ -37,25 +37,49 @@ def tradier_get(endpoint, params):
     except: pass
     return None
 
+@st.cache_data(ttl=3600)
+def get_open_market_days():
+    """Fetches the market calendar to identify only 'open' trading days."""
+    cal_data = tradier_get("markets/calendar", {})
+    open_days = set()
+    try:
+        if cal_data and 'calendar' in cal_data:
+            days = cal_data['calendar']['days']['day']
+            if isinstance(days, dict): days = [days]
+            for d in days:
+                if d['status'] == 'open':
+                    open_days.add(d['date'])
+    except: pass
+    return open_days
+
 def fetch_tradier_data(ticker, max_exp):
+    # 1. Get Market Calendar
+    open_days = get_open_market_days()
+
+    # 2. Get Spot Price
     quote_data = tradier_get("markets/quotes", {"symbols": ticker})
     if not quote_data or 'quotes' not in quote_data: return None, None
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
 
+    # 3. Get Expirations
     exp_data = tradier_get("markets/options/expirations", {"symbol": ticker, "includeAllRoots": "true"})
     if not exp_data: return S, None
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): all_exps = [all_exps]
     
+    # 4. Filter: Only fetch dates that are in the 'open' market calendar
+    valid_exps = [d for d in all_exps if d in open_days]
+    target_exps = valid_exps[:max_exp]
+    
     dfs = []
-    prog = st.progress(0)
-    for i, exp in enumerate(all_exps[:max_exp]):
+    prog = st.progress(0, text="Fetching Market-Open Expirations...")
+    for i, exp in enumerate(target_exps):
         chain = tradier_get("markets/options/chains", {"symbol": ticker, "expiration": exp, "greeks": "true"})
         if chain and 'options' in chain and chain['options']:
             opts = chain['options']['option']
             dfs.append(pd.DataFrame(opts) if isinstance(opts, list) else pd.DataFrame([opts]))
-        prog.progress((i+1)/max_exp)
+        prog.progress((i+1)/len(target_exps))
     prog.empty()
     return S, pd.concat(dfs) if dfs else None
 
@@ -87,23 +111,18 @@ def render_plots(df, ticker, S, mode):
     z_raw = pivot.values
     x_labs, y_labs = pivot.columns.tolist(), pivot.index.tolist()
     
-    # Heatmap Setup
     max_abs = np.max(np.abs(z_raw)) if z_raw.size else 1.0
     fig_h = go.Figure(data=go.Heatmap(
         z=z_raw, x=x_labs, y=y_labs, colorscale='Viridis', zmid=0, zmin=-max_abs, zmax=max_abs,
         colorbar=dict(title=f"{mode} ($)")
     ))
 
-    # CONDITIONAL ANNOTATIONS
+    # Conditional Annotations: Black for Pos, White for Neg
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
-            
-            # --- COLOR LOGIC ---
-            # Positive = Black text, Negative = White text
             font_color = "black" if val >= 0 else "white"
-            
             fig_h.add_annotation(
                 x=exp, y=strike,
                 text=f"${abs(val)/1e3:,.0f}K",
@@ -121,9 +140,9 @@ def render_plots(df, ticker, S, mode):
 # -------------------------
 def main():
     st.markdown("<div style='text-align:center;'><h2 style='font-size:18px;'>📊 GEX / VEX Pro (Tradier Live)</h2></div>", unsafe_allow_html=True)
-    c1, c2, c3, c4, c5 = st.columns([1.5, 1, 0.8, 1, 0.8])
+    c1, col_metric, c3, c4, c5 = st.columns([1.5, 1, 0.8, 1, 0.8])
     with c1: ticker = st.text_input("Ticker", "SPY").upper().strip()
-    with c2: mode = st.radio("Metric", ["GEX", "VEX"], horizontal=True)
+    with col_metric: mode = st.radio("Metric", ["GEX", "VEX"], horizontal=True)
     with c3: max_exp = st.number_input("Expiries", 1, 15, 6)
     with c4: s_range = st.number_input("Strike ±", 5, 500, 30)
     with c5: run = st.button("Run", type="primary")
@@ -133,12 +152,13 @@ def main():
         if S and raw_df is not None:
             processed = process_exposure(raw_df, S, s_range)
             if not processed.empty:
-                st.metric("Net Exposure", f"${processed[mode.lower()].sum()/1e9:,.2f}B")
+                net_val = processed[mode.lower()].sum() / 1e9
+                st.metric(f"Total Net {mode}", f"${net_val:,.2f}B")
                 h_fig, b_fig = render_plots(processed, ticker, S, mode)
                 st.plotly_chart(h_fig, use_container_width=True)
                 st.plotly_chart(b_fig, use_container_width=True)
-            else: st.warning("No data in range.")
-        else: st.error("Fetch failed.")
+            else: st.warning("No data found in this strike range.")
+        else: st.error("Fetch failed. Symbol may be invalid or market is closed.")
 
 if __name__ == "__main__":
     main()
