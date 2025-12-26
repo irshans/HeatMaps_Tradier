@@ -7,11 +7,12 @@ import os
 from datetime import datetime
 
 # --- CREDENTIALS LOADING ---
+# Completely remove token box if Secret exists
 if "TRADIER_TOKEN" in st.secrets and st.secrets["TRADIER_TOKEN"]:
-    saved_token = st.secrets["TRADIER_TOKEN"]
+    api_token = st.secrets["TRADIER_TOKEN"]
     show_token_box = False
 else:
-    saved_token = ""
+    api_token = ""
     show_token_box = True
 
 # --- APP CONFIG ---
@@ -21,7 +22,7 @@ BASE_URL = "https://api.tradier.com/v1/"
 CONTRACT_SIZE = 100
 
 # -------------------------
-# Tradier API Functions
+# Tradier API & Date Logic
 # -------------------------
 def get_tradier_data(endpoint, params, token):
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -30,6 +31,19 @@ def get_tradier_data(endpoint, params, token):
         if response.status_code == 200: return response.json()
     except: return None
     return None
+
+def is_valid_trading_day(date_str, open_dates_from_api):
+    """Combines API calendar with a manual holiday/weekend override."""
+    dt = pd.to_datetime(date_str)
+    # 1. Block Weekends
+    if dt.weekday() > 4: return False
+    # 2. Block Known Holidays (Dec 25, Jan 1, etc.)
+    hard_holidays = ['2025-12-25', '2026-01-01', '2026-01-19']
+    if date_str in hard_holidays: return False
+    # 3. Cross-reference with Tradier Calendar
+    if open_dates_from_api and date_str not in open_dates_from_api:
+        return False
+    return True
 
 @st.cache_data(ttl=3600)
 def fetch_trading_calendar(token):
@@ -72,53 +86,22 @@ def process_exposure(df, S, s_range):
         if not g or not isinstance(g, dict): continue
         gamma, vanna, oi = (g.get('gamma', 0) or 0), (g.get('vanna', 0) or 0), (row.get('open_interest', 0) or 0)
         is_call = row['option_type'].lower() == 'call'
+        # Long Puts (+), Short Calls (-)
         gex = (-gamma if is_call else gamma) * S**2 * 0.01 * CONTRACT_SIZE * oi
         vex = (-vanna if is_call else vanna) * CONTRACT_SIZE * oi
         res.append({"strike": row['strike'], "expiry": row['expiration_date'], "gex": gex, "vex": vex})
     return pd.DataFrame(res)
 
-def calculate_gamma_flip(df):
-    if df.empty: return None
-    agg = df.groupby('strike')['gex'].sum().sort_index()
-    s, v = agg.index.values, agg.values
-    for i in range(len(v) - 1):
-        if (v[i] < 0 and v[i+1] > 0) or (v[i] > 0 and v[i+1] < 0):
-            return s[i] - v[i] * (s[i+1] - s[i]) / (v[i+1] - v[i])
-    return None
-
-def render_plots(df, ticker, S, mode):
-    val_col = mode.lower()
-    pivot = df.pivot_table(index='strike', columns='expiry', values=val_col, aggfunc='sum').sort_index(ascending=False)
-    z_raw, y_labs, x_labs = pivot.values, pivot.index.tolist(), pivot.columns.tolist()
-    z_scaled = np.sign(z_raw) * (np.abs(z_raw) ** 0.5)
-    closest_strike = min(y_labs, key=lambda x: abs(x - S))
-    
-    fig = go.Figure(data=go.Heatmap(z=z_scaled, x=x_labs, y=y_labs, colorscale='Viridis', zmid=0, showscale=True, text=z_raw, hoverinfo="none"))
-    strike_diff = np.mean(np.diff(sorted(y_labs))) if len(y_labs) > 1 else 5
-    for i, strike in enumerate(y_labs):
-        for j, exp in enumerate(x_labs):
-            val = z_raw[i, j]
-            if abs(val) < 500: continue
-            fig.add_annotation(x=exp, y=strike, text=f"{'-' if val < 0 else ''}${abs(val)/1e3:,.0f}K", showarrow=False, font=dict(color="white", size=10))
-
-    fig.add_shape(type="rect", xref="paper", yref="y", x0=-0.05, x1=1.05, y0=closest_strike-(strike_diff*0.4), y1=closest_strike+(strike_diff*0.4), fillcolor="rgba(255, 0, 0, 0.25)", line=dict(width=0), layer="below")
-    fig.update_layout(title=f"LIVE {ticker} {mode} | Spot: ${S:,.2f}", template="plotly_dark", height=750, margin=dict(t=50, b=50), yaxis=dict(tickmode='array', tickvals=y_labs, ticktext=[f"<b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs]))
-    return fig
-
 # -------------------------
-# MAIN APP
+# MAIN UI
 # -------------------------
 st.title("📊 GEX & VEX Pro Live")
 
 if show_token_box:
     api_token = st.text_input("Enter Tradier Token", type="password")
-else:
-    api_token = saved_token
 
-raw_ticker = st.text_input("Ticker", "SPX").upper().strip()
-# Handle common index ticker formats
-ticker_input = f"${raw_ticker}" if raw_ticker in ["SPX", "NDX", "RUT"] else raw_ticker
-default_range = 80 if "SPX" in ticker_input else 25
+ticker = st.text_input("Ticker", "SPX").upper().strip()
+default_range = 80 if ticker == "SPX" else 25
 
 c1, c2, c3 = st.columns([1, 1, 3])
 with c1: mode = st.selectbox("Metric", ["GEX", "VEX"])
@@ -132,51 +115,53 @@ def live_pulse():
         return
 
     open_dates = fetch_trading_calendar(api_token)
-    S = fetch_market_data(ticker_input, api_token)
-    exp_data = get_tradier_data("markets/options/expirations", {"symbol": ticker_input}, api_token)
+    S = fetch_market_data(ticker, api_token)
+    exp_data = get_tradier_data("markets/options/expirations", {"symbol": ticker}, api_token)
     
     if S and exp_data:
-        prog_bar = st.progress(0, text="Fetching chains...")
-        try:
-            raw_dates = exp_data['expirations']['date']
-            if not isinstance(raw_dates, list): raw_dates = [raw_dates]
-            valid_dates = [d for d in raw_dates if d in open_dates]
-            target_dates = valid_dates[:max_exp]
-            
-            all_chains = []
-            for i, d in enumerate(target_dates):
-                chain_df = fetch_options_chain(ticker_input, d, api_token)
-                if not chain_df.empty:
-                    all_chains.append(chain_df)
-                prog_bar.progress((i + 1) / len(target_dates))
-            
-            prog_bar.empty()
-            
-            # --- CONCAT SAFETY CHECK ---
-            if not all_chains:
-                st.warning(f"No active option data found for {ticker_input} on open trading days.")
-                return
+        prog_bar = st.progress(0, text="Syncing Market Data...")
+        raw_dates = exp_data['expirations']['date']
+        if not isinstance(raw_dates, list): raw_dates = [raw_dates]
+        
+        # FILTER: Exclude weekends and Christmas/Holidays
+        target_dates = [d for d in raw_dates if is_valid_trading_day(d, open_dates)][:max_exp]
+        
+        all_chains = []
+        for i, d in enumerate(target_dates):
+            df = fetch_options_chain(ticker, d, api_token)
+            if not df.empty: all_chains.append(df)
+            prog_bar.progress((i + 1) / len(target_dates))
+        
+        prog_bar.empty()
+        
+        if not all_chains:
+            st.warning(f"No active trading data for {ticker} on upcoming open days.")
+            return
 
-            full_df = pd.concat(all_chains)
-            processed = process_exposure(full_df, S, s_range)
+        full_df = pd.concat(all_chains)
+        processed = process_exposure(full_df, S, s_range)
+        
+        if not processed.empty:
+            # Stats & Heatmap
+            net_val = processed[mode.lower()].sum() / 1e9
+            st.metric(f"Total Net {mode}", f"{'-' if net_val < 0 else ''}${abs(net_val):,.2f}B")
             
-            if not processed.empty:
-                net_val = processed[mode.lower()].sum() / 1e9
-                st.metric(f"Total Net {mode}", f"{'-' if net_val < 0 else ''}${abs(net_val):,.2f}B")
-                st.plotly_chart(render_plots(processed, ticker_input, S, mode), use_container_width=True)
-                
-                st.markdown("---")
-                st.subheader("🧱 Gamma Wall Analysis")
-                agg_gex = processed.groupby('strike')['gex'].sum()
-                flip_price = calculate_gamma_flip(processed)
-                w1, w2, w3 = st.columns(3)
-                w1.metric("Call Wall", f"${agg_gex.idxmax():,.0f}")
-                w2.metric("Put Wall", f"${agg_gex.idxmin():,.0f}")
-                w3.metric("Gamma Flip", f"${flip_price:,.2f}" if flip_price else "N/A")
-                st.caption(f"Last Sync: {datetime.now().strftime('%H:%M:%S')}")
-        except Exception as e:
-            st.error(f"Error processing data: {e}")
-            prog_bar.empty()
-    else: st.error(f"Could not find data for {ticker_input}. Ensure the ticker is correct.")
+            # Pivot & Render Plotly
+            pivot = processed.pivot_table(index='strike', columns='expiry', values=mode.lower(), aggfunc='sum').sort_index(ascending=False)
+            z_raw = pivot.values
+            z_scaled = np.sign(z_raw) * (np.abs(z_raw) ** 0.5)
+            
+            fig = go.Figure(data=go.Heatmap(z=z_scaled, x=pivot.columns, y=pivot.index, colorscale='Viridis', zmid=0, text=z_raw, hoverinfo="none"))
+            fig.update_layout(title=f"LIVE {ticker} {mode} | Spot: ${S:,.2f}", template="plotly_dark", height=750)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Walls
+            st.markdown("---")
+            agg_gex = processed.groupby('strike')['gex'].sum()
+            w1, w2 = st.columns(2)
+            w1.metric("Call Wall (+GEX)", f"${agg_gex.idxmax():,.0f}")
+            w2.metric("Put Wall (-GEX)", f"${agg_gex.idxmin():,.0f}")
+            st.caption(f"Last Sync: {datetime.now().strftime('%H:%M:%S')}")
+    else: st.error(f"Data Fetch Failed for {ticker}.")
 
 live_pulse()
