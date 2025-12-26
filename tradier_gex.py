@@ -92,7 +92,6 @@ def process_exposure(df, S, s_range):
         g = row.get('greeks')
         if not g or not isinstance(g, dict): continue
         gamma, vanna, oi = float(g.get('gamma', 0) or 0), float(g.get('vanna', 0) or 0), int(row.get('open_interest', 0) or 0)
-        # Dealer position logic: Short Calls (-), Long Puts (+)
         dealer_pos = -1 if row['option_type'].lower() == 'call' else 1
         res.append({
             "strike": row['strike'], "expiry": row['expiration_date'],
@@ -105,38 +104,65 @@ def render_plots(df, ticker, S, mode):
     if df.empty: return None, None
     val_col = mode.lower()
     agg = df.groupby('strike')[val_col].sum().sort_index()
-    pivot = df.pivot_table(index='strike', columns='expiry', values=val_col, aggfunc='sum', fill_value=0).sort_index(ascending=False)
-
-    z_raw = pivot.values
-    x_labs, y_labs = pivot.columns.tolist(), pivot.index.tolist()
     
-    max_abs = np.max(np.abs(z_raw)) if z_raw.size else 1.0
+    # Pivot for Heatmap
+    pivot = df.pivot_table(index='strike', columns='expiry', values=val_col, aggfunc='sum', fill_value=0).sort_index(ascending=False)
+    z_raw = pivot.values
+    x_labs = [str(x) for x in pivot.columns.tolist()]
+    y_labs = pivot.index.tolist()
+    
+    # Find Global Max Absolute Value for the Star Feature
+    max_abs_val = np.max(np.abs(z_raw)) if z_raw.size else 0
+    max_abs_indices = np.where(np.abs(z_raw) == max_abs_val) if max_abs_val > 0 else ([], [])
+    
+    max_abs_scale = np.max(np.abs(z_raw)) if z_raw.size else 1.0
+    
     fig_h = go.Figure(data=go.Heatmap(
-        z=z_raw, x=x_labs, y=y_labs, colorscale='Viridis', zmid=0, zmin=-max_abs, zmax=max_abs,
+        z=z_raw, x=x_labs, y=y_labs, 
+        colorscale='Viridis', zmid=0, zmin=-max_abs_scale, zmax=max_abs_scale,
         colorbar=dict(title=f"{mode} ($)")
     ))
 
-    # Conditional Annotations: Positive=Black, Negative=White
+    # Conditional Annotations
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
+            
+            # Check if this is the maximum absolute value
+            is_max = (i == max_abs_indices[0][0] and j == max_abs_indices[1][0]) if max_abs_val > 0 else False
+            star = " ★" if is_max else ""
+            
             font_color = "black" if val >= 0 else "white"
             fig_h.add_annotation(
-                x=exp, y=strike, text=f"${abs(val)/1e3:,.0f}K",
-                showarrow=False, font=dict(color=font_color, size=10, family="Arial Black")
+                x=exp, y=strike, text=f"${abs(val)/1e3:,.0f}K{star}",
+                showarrow=False, 
+                font=dict(color=font_color, size=10, family="Arial")
             )
 
-    fig_h.update_layout(title=f"{ticker} {mode} | Spot: ${S:,.2f}", template="plotly_dark", height=850)
+    fig_h.update_layout(
+        title=f"{ticker} {mode} Heatmap | Spot: ${S:,.2f}", 
+        template="plotly_dark", 
+        height=850,
+        font=dict(family="Arial"),
+        xaxis=dict(type='category', tickmode='array', tickvals=x_labs, title="Expiration"),
+        yaxis=dict(title="Strike")
+    )
+
     fig_b = go.Figure(go.Bar(x=agg.index, y=agg.values, marker_color=['#2563eb' if v < 0 else '#fbbf24' for v in agg.values]))
-    fig_b.update_layout(title=f"Net {mode} by Strike", template="plotly_dark", height=350)
+    fig_b.update_layout(
+        title=f"Net {mode} by Strike", 
+        template="plotly_dark", 
+        height=350,
+        font=dict(family="Arial")
+    )
     return fig_h, fig_b
 
 # -------------------------
 # Main App
 # -------------------------
 def main():
-    st.markdown("<div style='text-align:center;'><h2 style='font-size:18px;'>📊 GEX / VEX Pro (Tradier Native)</h2></div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align:center;'><h2 style='font-size:18px; font-family:Arial;'>📊 GEX / VEX Pro (Tradier Native)</h2></div>", unsafe_allow_html=True)
     
     ticker = st.text_input("Ticker", "SPX").upper().strip()
     
