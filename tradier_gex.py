@@ -13,6 +13,7 @@ st.markdown("""
     .block-container { padding-top: 24px; padding-bottom: 8px; }
     button[kind="primary"], .stButton>button { padding:4px 8px !important; font-size:12px !important; height:30px !important; }
     input[type="text"], input[type="number"], select { padding:6px 8px !important; font-size:12px !important; height:28px !important; }
+    [data-testid="stMetricValue"] { font-size: 22px !important; }
     h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; }
     </style>
     """, unsafe_allow_html=True)
@@ -34,7 +35,7 @@ CUSTOM_COLORSCALE = [
 ]
 
 # -------------------------
-# Tradier API Methods
+# API & Processing
 # -------------------------
 def tradier_get(endpoint, params):
     headers = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
@@ -47,8 +48,7 @@ def tradier_get(endpoint, params):
 @st.cache_data(ttl=3600)
 def get_market_days():
     open_days = set()
-    current_year = datetime.now().year
-    for year in [current_year, current_year + 1]:
+    for year in [2025, 2026]:
         for month in range(1, 13):
             cal = tradier_get("markets/calendar", {"month": month, "year": year})
             try:
@@ -70,7 +70,6 @@ def fetch_data(ticker, max_exp):
     if not exp_data: return S, None
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): all_exps = [all_exps]
-    
     valid_exps = [exp for exp in all_exps if exp in open_days][:max_exp]
     
     dfs = []
@@ -84,10 +83,7 @@ def fetch_data(ticker, max_exp):
     prog.empty()
     return S, pd.concat(dfs) if dfs else None
 
-# -------------------------
-# GEX Calculation
-# -------------------------
-def process_gex(df, S, s_range):
+def process_exposure(df, S, s_range):
     if df is None or df.empty: return pd.DataFrame()
     df["strike"] = pd.to_numeric(df["strike"])
     df = df[(df["strike"] >= S - s_range) & (df["strike"] <= S + s_range)].copy()
@@ -99,37 +95,25 @@ def process_gex(df, S, s_range):
         gamma, vega = float(g.get('gamma', 0) or 0), float(g.get('vega', 0) or 0)
         oi, op_type = int(row.get('open_interest', 0) or 0), row['option_type'].lower()
         
-        # Dealer: Short Calls (-1) / Long Puts (+1)
-        dealer_pos = -1 if op_type == 'call' else 1
+        # side: Call = +1 (Dealer Long), Put = -1 (Dealer Short)
+        side = 1 if op_type == 'call' else -1
         
         res.append({
             "strike": row['strike'], "expiry": row['expiration_date'],
-            "gex": dealer_pos * gamma * (S**2) * 0.01 * CONTRACT_SIZE * oi,
-            "vex": dealer_pos * vega * 0.01 * CONTRACT_SIZE * oi,
-            "option_type": op_type, "oi": oi
+            "gex": side * gamma * (S**2) * 0.01 * CONTRACT_SIZE * oi,
+            "vex": side * vega * 0.01 * CONTRACT_SIZE * oi,
+            "type": op_type, "oi": oi
         })
     return pd.DataFrame(res)
 
 # -------------------------
-# Visualization Functions
+# Visualization
 # -------------------------
-def render_gamma_wall_chart(df, S):
-    if df.empty: return None
-    agg = df.groupby('strike')['gex'].sum().sort_index()
-    colors = ['#2563eb' if v < 0 else '#fbbf24' for v in agg.values]
-    
-    fig = go.Figure(go.Bar(x=agg.index, y=agg.values, marker_color=colors))
-    fig.add_vline(x=S, line_color="white", line_dash="dot", annotation_text="Spot")
-    fig.update_layout(title="Net GEX by Strike", template="plotly_dark", height=400)
-    return fig
-
 def render_heatmap(df, ticker, S):
-    # Pivot the data
     pivot = df.pivot_table(index='strike', columns='expiry', values='gex', aggfunc='sum').sort_index(ascending=False).fillna(0)
     z_raw = pivot.values
     x_labs, y_labs = pivot.columns.tolist(), pivot.index.tolist()
     
-    # Calculate symmetry for colorscale
     abs_max = np.max(np.abs(z_raw)) if z_raw.size else 1.0
     
     fig = go.Figure(data=go.Heatmap(
@@ -138,55 +122,65 @@ def render_heatmap(df, ticker, S):
         colorbar=dict(title="GEX ($)")
     ))
 
-    # Cell Annotations logic remains the same...
+    # Cell Annotations
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if abs(val) < 500: continue
             label = f"${val/1e3:,.0f}K"
-            t_color = "black" if val > 0 else "white"
+            t_color = "black" if val >= 0 else "white"
             fig.add_annotation(x=exp, y=strike, text=label, showarrow=False,
-                               font=dict(color=t_color, size=11, family="Arial"))
+                               font=dict(color=t_color, size=10, family="Arial"))
 
-    # --- MODIFIED SECTION START ---
+    # Dynamic Height Calculation: ~22 pixels per strike row
+    calc_height = max(600, len(y_labs) * 22)
+
     fig.update_layout(
         title=f"{ticker} GEX Heatmap | Spot: ${S:,.2f}", 
-        template="plotly_dark", 
-        height=len(y_labs) * 25,  # Dynamically scale height so labels aren't crushed
+        template="plotly_dark", height=calc_height,
         xaxis=dict(type='category', side='top'),
         yaxis=dict(
             title="Strike",
-            tickmode='array',      # Manual tick control
-            tickvals=y_labs,       # Show a tick for every strike in data
-            ticktext=[f"{s:,.0f}" for s in y_labs], # Format as numbers
-            autorange=True
+            tickmode='array',
+            tickvals=y_labs,
+            ticktext=[f"{s:,.0f}" for s in y_labs]
         ),
-        margin=dict(l=80, r=60, t=100, b=40)
+        margin=dict(l=80, r=40, t=100, b=40)
     )
-    # --- MODIFIED SECTION END ---
-    
     return fig
 
 # -------------------------
-# Main App
+# Main Execution
 # -------------------------
 def main():
-    st.markdown("<div style='text-align:center;'><h2 style='font-size:18px;'>📊 GEX Pro (Tradier)</h2></div>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;'>📊 Professional GEX Analytics</h2>", unsafe_allow_html=True)
     
-    col1, col2, col3, col4 = st.columns([1.5, 1, 1, 0.8])
-    with col1: ticker = st.text_input("Ticker", "SPX").upper().strip()
-    with col2: max_exp = st.number_input("Max Exp", 1, 15, 5)
-    with col3: s_range = st.number_input("Strike ±", 10, 500, 80)
-    with col4: run = st.button("Run", type="primary")
+    c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8])
+    ticker = c1.text_input("Ticker", "SPX").upper().strip()
+    max_exp = c2.number_input("Expiries", 1, 15, 5)
+    s_range = c3.number_input("Strike ±", 10, 500, 80)
+    run = c4.button("Run Sync", type="primary")
 
     if run:
         S, raw_df = fetch_data(ticker, int(max_exp))
         if S and raw_df is not None:
-            processed = process_gex(raw_df, S, s_range)
-            if not processed.empty:
-                # Render UI
-                st.plotly_chart(render_heatmap(processed, ticker, S), use_container_width=True)
-                st.plotly_chart(render_gamma_wall_chart(processed, S), use_container_width=True)
+            df = process_exposure(raw_df, S, s_range)
+            if not df.empty:
+                # --- METRICS HEADER ---
+                net_gex = df["gex"].sum() / 1e9
+                net_vex = df["vex"].sum() / 1e6
+                calls = df[df["type"] == "call"]["oi"].sum()
+                puts = df[df["type"] == "put"]["oi"].sum()
+                cp_ratio = calls / puts if puts > 0 else 0
+                
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Net GEX", f"${net_gex:,.2f}B")
+                m2.metric("Net VEX", f"${net_vex:,.1f}M")
+                m3.metric("Total Calls", f"{calls:,.0f}")
+                m4.metric("Total Puts", f"{puts:,.0f}")
+                m5.metric("Call/Put Ratio", f"{cp_ratio:.2f}")
+                
+                st.plotly_chart(render_heatmap(df, ticker, S), use_container_width=True)
             else: st.warning("No data found.")
         else: st.error("Fetch failed.")
 
