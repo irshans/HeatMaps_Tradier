@@ -131,13 +131,20 @@ def fetch_data(ticker, max_exp):
     if not isinstance(all_exps, list): 
         all_exps = [all_exps]
     
+    # Debug: Show first 10 expirations from API
+    st.write(f"DEBUG: First 10 expirations from API: {all_exps[:10]}")
+    
     # Take first max_exp, then filter to only open days to ensure chronological order
     valid_exps = []
     for exp in all_exps:
         if exp in open_days:
             valid_exps.append(exp)
+        else:
+            st.write(f"DEBUG: Skipping {exp} - not in open_days")
         if len(valid_exps) >= max_exp:
             break
+    
+    st.write(f"DEBUG: Selected {len(valid_exps)} expirations: {valid_exps}")
     
     dfs = []
     prog = st.progress(0, text="Fetching Live Greeks...")
