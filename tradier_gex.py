@@ -112,6 +112,12 @@ def get_market_days():
 
 def fetch_data(ticker, max_exp):
     open_days = get_market_days()
+    
+    # Debug: Show what calendar days we have
+    if open_days:
+        sorted_days = sorted(list(open_days))
+        st.write(f"DEBUG: Market calendar has {len(open_days)} open days from {sorted_days[0]} to {sorted_days[-1]}")
+    
     quote_data = tradier_get("markets/quotes", {"symbols": ticker})
     if not quote_data: 
         return None, None
@@ -124,7 +130,14 @@ def fetch_data(ticker, max_exp):
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): 
         all_exps = [all_exps]
-    valid_exps = [d for d in all_exps if d in open_days][:max_exp]
+    
+    # Take first max_exp, then filter to only open days to ensure chronological order
+    valid_exps = []
+    for exp in all_exps:
+        if exp in open_days:
+            valid_exps.append(exp)
+        if len(valid_exps) >= max_exp:
+            break
     
     dfs = []
     prog = st.progress(0, text="Fetching Live Greeks...")
