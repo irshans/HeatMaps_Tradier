@@ -116,51 +116,26 @@ def get_market_days():
 def fetch_data(ticker, max_exp):
     open_days = get_market_days()
     
-    # Debug: Show what calendar days we have
-    if open_days:
-        sorted_days = sorted(list(open_days))
-        st.write(f"DEBUG: Market calendar has {len(open_days)} open days from {sorted_days[0]} to {sorted_days[-1]}")
-    else:
-        st.write("DEBUG: No open_days returned from calendar!")
-    
     quote_data = tradier_get("markets/quotes", {"symbols": ticker})
-    if not quote_data:
-        st.write("DEBUG: Quote fetch failed")
+    if not quote_data: 
         return None, None
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
-    st.write(f"DEBUG: Got spot price: ${S}")
 
     exp_data = tradier_get("markets/options/expirations", {"symbol": ticker, "includeAllRoots": "true"})
-    if not exp_data:
-        st.write("DEBUG: Expirations fetch failed")
+    if not exp_data: 
         return S, None
-    
-    st.write(f"DEBUG: Raw exp_data keys: {exp_data.keys()}")
-    
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): 
         all_exps = [all_exps]
     
-    # Debug: Show first 10 expirations from API
-    st.write(f"DEBUG: First 10 expirations from API: {all_exps[:10]}")
-    st.write(f"DEBUG: Total expirations available: {len(all_exps)}")
-    
-    # Take first max_exp, then filter to only open days to ensure chronological order
+    # Take first max_exp valid open market days to ensure chronological order
     valid_exps = []
-    skipped = []
-    for i, exp in enumerate(all_exps):
+    for exp in all_exps:
         if exp in open_days:
             valid_exps.append(exp)
-        else:
-            skipped.append(exp)
         if len(valid_exps) >= max_exp:
-            st.write(f"DEBUG: Stopped after checking {i+1} expirations")
             break
-    
-    if skipped:
-        st.write(f"DEBUG: Skipped {len(skipped)} dates: {skipped[:5]}")
-    st.write(f"DEBUG: Selected {len(valid_exps)} expirations: {valid_exps}")
     
     dfs = []
     prog = st.progress(0, text="Fetching Live Greeks...")
@@ -174,7 +149,7 @@ def fetch_data(ticker, max_exp):
     return S, pd.concat(dfs) if dfs else None
 
 # -------------------------
-# Pure GEX Calculation
+# GEX & VEX Calculation
 # -------------------------
 def process_gex(df, S, s_range):
     if df is None or df.empty: 
@@ -188,22 +163,119 @@ def process_gex(df, S, s_range):
         if not g: 
             continue
         gamma = float(g.get('gamma', 0) or 0)
+        vega = float(g.get('vega', 0) or 0)
         oi = int(row.get('open_interest', 0) or 0)
+        option_type = row['option_type'].lower()
         
         # Dealer model: Short Calls (-1) / Long Puts (+1)
-        dealer_pos = -1 if row['option_type'].lower() == 'call' else 1
+        dealer_pos = -1 if option_type == 'call' else 1
         
-        # GEX Formula
+        # GEX Formula (per 1% spot move)
         gex_val = dealer_pos * gamma * (S**2) * 0.01 * CONTRACT_SIZE * oi
+        # VEX Formula (per 1% IV move)
+        vex_val = dealer_pos * vega * 0.01 * CONTRACT_SIZE * oi
         
         res.append({
             "strike": row['strike'], 
             "expiry": row['expiration_date'],
-            "gex": gex_val
+            "gex": gex_val,
+            "vex": vex_val,
+            "option_type": option_type,
+            "oi": oi
         })
     return pd.DataFrame(res)
 
-def render_heatmap(df, ticker, S):
+def render_gamma_wall_chart(df, S):
+    """Create gamma wall bar chart showing net GEX by strike with put/call walls and flip point"""
+    if df.empty:
+        return None
+    
+    # Aggregate by strike
+    agg = df.groupby('strike')['gex'].sum().sort_index()
+    
+    # Find key levels
+    max_neg_strike = agg[agg == agg.min()].index[0] if agg.min() < 0 else None
+    max_pos_strike = agg[agg == agg.max()].index[0] if agg.max() > 0 else None
+    
+    # Find gamma flip (where GEX crosses zero)
+    gamma_flip = None
+    strikes = agg.index.tolist()
+    for i in range(len(strikes) - 1):
+        if agg.iloc[i] < 0 and agg.iloc[i + 1] > 0:
+            gamma_flip = strikes[i + 1]
+            break
+        elif agg.iloc[i] > 0 and agg.iloc[i + 1] < 0:
+            gamma_flip = strikes[i]
+            break
+    
+    # Create bar chart
+    colors = ['#2563eb' if v < 0 else '#fbbf24' for v in agg.values]
+    
+    fig = go.Figure(go.Bar(
+        x=agg.index,
+        y=agg.values,
+        marker_color=colors,
+        hovertemplate='Strike: $%{x:,.0f}<br>GEX: $%{y:,.0f}<extra></extra>'
+    ))
+    
+    # Add spot price marker
+    fig.add_annotation(
+        x=S, y=0,
+        text="▲ Spot",
+        showarrow=False,
+        font=dict(color="yellow", size=12),
+        yref="paper",
+        yshift=-20
+    )
+    
+    # Add Put Wall annotation (largest negative GEX)
+    if max_neg_strike:
+        fig.add_annotation(
+            x=max_neg_strike,
+            y=agg[max_neg_strike],
+            text="Put Wall",
+            showarrow=True,
+            arrowhead=2,
+            arrowcolor="#2563eb",
+            font=dict(color="#2563eb", size=11),
+            ax=0,
+            ay=-40
+        )
+    
+    # Add Call Wall annotation (largest positive GEX)
+    if max_pos_strike:
+        fig.add_annotation(
+            x=max_pos_strike,
+            y=agg[max_pos_strike],
+            text="Call Wall",
+            showarrow=True,
+            arrowhead=2,
+            arrowcolor="#fbbf24",
+            font=dict(color="#fbbf24", size=11),
+            ax=0,
+            ay=40
+        )
+    
+    # Add Gamma Flip line
+    if gamma_flip:
+        fig.add_vline(
+            x=gamma_flip,
+            line_dash="dash",
+            line_color="white",
+            annotation_text=f"Gamma Flip: ${gamma_flip:,.0f}",
+            annotation_position="top"
+        )
+    
+    fig.update_layout(
+        title="Gamma Wall (Net GEX by Strike)",
+        template="plotly_dark",
+        height=400,
+        xaxis=dict(title="Strike", tickformat=",d"),
+        yaxis=dict(title="Net GEX ($)", tickformat="$,.2s"),
+        showlegend=False
+    )
+    
+    return fig
     pivot = df.pivot_table(index='strike', columns='expiry', values='gex', aggfunc='sum').sort_index(ascending=False).fillna(0)
     
     z_raw = pivot.values
@@ -323,15 +395,34 @@ def main():
         if S and raw_df is not None:
             processed = process_gex(raw_df, S, s_range)
             if not processed.empty:
-                # Display net GEX metric (no + sign for positive)
+                # Calculate metrics
                 t_gex = processed["gex"].sum() / 1e9
+                t_vex = processed["vex"].sum() / 1e9
+                total_calls = processed[processed["option_type"] == "call"]["oi"].sum()
+                total_puts = processed[processed["option_type"] == "put"]["oi"].sum()
+                call_put_ratio = total_calls / total_puts if total_puts > 0 else 0
+                
+                # Display metrics in columns
+                col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+                
                 p_g = "-" if t_gex < 0 else ""
-                st.metric("Net Dealer GEX", f"{p_g}${abs(t_gex):,.2f}B")
+                p_v = "-" if t_vex < 0 else ""
+                
+                col_m1.metric("Net Dealer GEX", f"{p_g}${abs(t_gex):,.2f}B")
+                col_m2.metric("Net Dealer VEX", f"{p_v}${abs(t_vex):,.2f}B")
+                col_m3.metric("Total Calls", f"{total_calls:,.0f}")
+                col_m4.metric("Total Puts", f"{total_puts:,.0f}")
+                col_m5.metric("Call/Put Ratio", f"{call_put_ratio:.2f}")
                 
                 # Render heatmap
                 fig = render_heatmap(processed, ticker, S)
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
+                
+                # Render gamma wall chart
+                gamma_fig = render_gamma_wall_chart(processed, S)
+                if gamma_fig:
+                    st.plotly_chart(gamma_fig, use_container_width=True)
             else: 
                 st.warning("No data in range. Broaden strike range or check ticker.")
         else: 
