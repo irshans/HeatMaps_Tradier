@@ -116,6 +116,9 @@ def render_heatmap(df, ticker, S):
     x_labs, y_labs = pivot.columns.tolist(), pivot.index.tolist()
     abs_limit = np.max(np.abs(z_raw)) if z_raw.size else 1.0
     
+    # Identify the specific strike row for Spot
+    closest_strike = min(y_labs, key=lambda x: abs(x - S))
+
     fig = go.Figure(data=go.Heatmap(
         z=z_raw, x=x_labs, y=y_labs, 
         colorscale=CUSTOM_COLORSCALE, zmin=-abs_limit, zmax=abs_limit, zmid=0,
@@ -130,16 +133,28 @@ def render_heatmap(df, ticker, S):
             star = " ★" if abs(val) == abs_limit and abs_limit > 0 else ""
             label = f"${val/1e3:,.0f}K{star}"
             t_color = "black" if val >= 0 else "white"
+            
+            # If this is the spot strike, we can make the font bold or a different color
+            is_spot_row = (strike == closest_strike)
+            
             fig.add_annotation(
                 x=exp, y=strike, text=label, showarrow=False,
-                font=dict(color=t_color, size=12, family="Arial")
+                font=dict(
+                    color="cyan" if is_spot_row and val < 0 else t_color, 
+                    size=12, 
+                    family="Arial",
+                    weight="bold" if is_spot_row else "normal"
+                )
             )
 
-    # Highlight Spot Strike
-    closest_strike = min(y_labs, key=lambda x: abs(x - S))
-    fig.add_shape(type="rect", xref="paper", yref="y", x0=0, x1=1,
-                  y0=closest_strike - 2, y1=closest_strike + 2,
-                  line=dict(color="rgba(255, 255, 255, 0.5)", width=2), fillcolor="rgba(255,255,255,0.1)")
+    # REFINED SPOT MARKER: Single dashed line across the specific strike
+    fig.add_shape(
+        type="line",
+        xref="paper", yref="y",
+        x0=0, x1=1,
+        y0=closest_strike, y1=closest_strike,
+        line=dict(color="rgba(255, 255, 255, 0.8)", width=3, dash="dot"),
+    )
 
     calc_height = max(600, len(y_labs) * 25)
 
@@ -149,7 +164,8 @@ def render_heatmap(df, ticker, S):
         xaxis=dict(type='category', side='top', tickfont=dict(size=12)),
         yaxis=dict(
             title="Strike", tickmode='array', tickvals=y_labs,
-            ticktext=[f"<b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs],
+            # Visual indicator on the Y-Axis itself
+            ticktext=[f"➔ <b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs],
             tickfont=dict(size=12)
         )
     )
