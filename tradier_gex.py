@@ -16,6 +16,8 @@ st.markdown("""
     [data-testid="stMetricValue"] { font-size: 22px !important; font-family: 'Arial' !important; }
     h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; font-weight: bold; }
     hr { margin: 15px 0 !important; }
+    /* Styling the diagnostic table */
+    [data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -101,17 +103,25 @@ def process_exposure(df, S, s_range):
         oi, side = int(row.get('open_interest', 0) or 0), (1 if row['option_type'].lower() == 'call' else -1)
 
         gex = side * gamma * (S**2) * 0.01 * 100 * oi
-        vanex = (side * (vega / (S * iv)) * S * 0.01 * 100 * oi) if (S > 0 and iv > 0) else 0
-        res.append({"strike": row['strike'], "expiry": row['expiration_date'], "gex": gex, "vanex": vanex, "type": row['option_type'].lower(), "oi": oi})
+        vanna_raw = vega / (S * iv) if (S > 0 and iv > 0) else 0
+        vanex = side * vanna_raw * S * 0.01 * 100 * oi
+        
+        res.append({
+            "strike": row['strike'], 
+            "expiry": row['expiration_date'], 
+            "gex": gex, 
+            "vanex": vanex, 
+            "gamma": gamma * side * oi, # Raw dealer gamma
+            "type": row['option_type'].lower(), 
+            "oi": oi
+        })
     return pd.DataFrame(res)
 
 def find_gamma_flip(df):
     if df.empty: return None
     strike_sums = df.groupby('strike')['gex'].sum().sort_index()
-    # Find where the sign changes from negative to positive
     for i in range(len(strike_sums) - 1):
         if (strike_sums.iloc[i] < 0 and strike_sums.iloc[i+1] > 0) or (strike_sums.iloc[i] > 0 and strike_sums.iloc[i+1] < 0):
-            # Return the strike closest to zero GEX
             return strike_sums.index[i] if abs(strike_sums.iloc[i]) < abs(strike_sums.iloc[i+1]) else strike_sums.index[i+1]
     return None
 
@@ -131,20 +141,9 @@ def render_heatmap(df, ticker, S, mode, flip_strike):
             label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
             fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color="white" if val < 0 else "black", size=10, family="Arial Black"))
 
-    # Custom Y-Axis Labels to show Spot and Flip
-    y_text = []
-    for s in y_labs:
-        label = str(s)
-        if s == closest_strike: label = f"➔ <b>{s}</b>"
-        if s == flip_strike: label = f"⚠️ <b>{s} FLIP</b>"
-        y_text.append(label)
+    y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
 
-    fig.update_layout(
-        title=f"{ticker} {mode} Matrix", 
-        template="plotly_dark", height=700, 
-        xaxis=dict(side='top', type='category', categoryorder='array', categoryarray=x_labs), 
-        yaxis=dict(ticktext=y_text, tickvals=y_labs)
-    )
+    fig.update_layout(title=f"{ticker} {mode} Matrix", template="plotly_dark", height=700, xaxis=dict(side='top', type='category'), yaxis=dict(ticktext=y_text, tickvals=y_labs))
     return fig
 
 # -------------------------
@@ -164,9 +163,6 @@ def main():
 
     @st.fragment(run_every="600s")
     def dashboard_content():
-        now = datetime.now(pytz.timezone('US/Eastern')).strftime("%H:%M:%S")
-        st.write(f"🕒 Last update: **{now} EST** (Next auto-refresh in 10m)")
-        
         S, raw_df = fetch_data(ticker, max_exp)
         if S and raw_df is not None:
             df = process_exposure(raw_df, S, s_range)
@@ -182,11 +178,42 @@ def main():
                 st.markdown("---")
                 col_gex, col_van = st.columns(2)
                 with col_gex:
-                    st.markdown("### 🟢 GEX Exposure (Gamma)")
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), width="stretch")
                 with col_van:
-                    st.markdown("### 🟠 VANEX Exposure (Vanna)")
                     st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), width="stretch")
+
+                # --- NEW DIAGNOSTIC TABLE ---
+                st.markdown("### 🔍 Top 5 Strikes Closest to Spot")
+                
+                # Aggregate data by strike
+                strike_diag = df.groupby('strike').agg({
+                    'gex': [('Call GEX', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
+                            ('Put GEX', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
+                            ('Net GEX', 'sum')],
+                    'vanex': [('Call Vanna', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
+                              ('Put Vanna', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
+                              ('Net Vanna', 'sum')],
+                    'gamma': [('Call Gamma', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
+                              ('Put Gamma', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
+                              ('Net Gamma', 'sum')]
+                })
+                
+                # Flatten columns and find 5 closest to spot
+                strike_diag.columns = [c[1] for c in strike_diag.columns]
+                strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
+                closest_strikes = strike_diag.iloc[(strike_diag.index - S).abs().argsort()[:5]].sort_index(ascending=False)
+
+                # Format and Color
+                def color_greeks(val):
+                    color = '#2ecc71' if val > 0 else '#e74c3c'
+                    return f'color: {color}'
+
+                st.dataframe(
+                    closest_strikes.style.format("${:,.0f}")
+                    .applymap(color_greeks, subset=['Net GEX', 'Net Vanna', 'Net Gamma']),
+                    width="stretch"
+                )
+                
             else: st.warning("No data in range.")
         else: st.error("API Error.")
 
