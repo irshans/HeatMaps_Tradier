@@ -103,28 +103,28 @@ def process_exposure(df, S, s_range):
         g = row.get('greeks')
         if not g or not isinstance(g, dict): continue
         
-        # Pull base components
-        gamma = float(g.get('gamma', 0) or 0)
-        vega  = float(g.get('vega', 0) or 0)
-        # Pulling IV to calculate Vanna manually
-        iv    = float(g.get('mid_iv', 0) or 0) 
+        # 1. Pull Gamma and Vega
+        gamma = float(g.get('gamma') or 0)
+        vega  = float(g.get('vega') or 0)
         
-        oi      = int(row.get('open_interest', 0) or 0)
+        # 2. Robust IV Extraction (Fallback Chain)
+        iv = float(g.get('smv_vol') or g.get('mid_iv') or g.get('ask_iv') or 0)
+        
+        # Scale to decimal if needed
+        if iv > 1.0: iv /= 100.0
+            
+        oi      = int(row.get('open_interest') or 0)
         op_type = row['option_type'].lower()
         side    = 1 if op_type == 'call' else -1
 
-        # --- MANUAL VANNA CALCULATION ---
-        # Formula: Vanna = Vega / (Spot * IV)
-        if S > 0 and iv > 0:
-            calculated_vanna = vega / (S * iv)
+        # 3. Manual Vanna Calculation: Vanna = Vega / (Spot * IV)
+        if S > 0 and iv > 0 and vega != 0:
+            vanna = vega / (S * iv)
         else:
-            calculated_vanna = 0
+            vanna = 0
             
-        # --- EXPOSURE CALCULATION ---
-        # GEX: Gamma * Spot^2 * 0.01 * 100 * OI
         gex = side * gamma * (S**2) * 0.01 * CONTRACT_SIZE * oi
-        # VANEX: Vanna * Spot * 0.01 (standardized 1% IV shift) * 100 * OI
-        vanex = side * calculated_vanna * S * 0.01 * CONTRACT_SIZE * oi
+        vanex = side * vanna * S * 0.01 * CONTRACT_SIZE * oi
         
         res.append({
             "strike": row['strike'], 
@@ -132,7 +132,9 @@ def process_exposure(df, S, s_range):
             "gex": gex,
             "vanex": vanex,
             "type": op_type, 
-            "oi": oi
+            "oi": oi,
+            "vega_raw": vega,
+            "iv_raw": iv
         })
         
     return pd.DataFrame(res)
@@ -154,14 +156,11 @@ def render_heatmap(df, ticker, S, mode):
         colorbar=dict(title=f"{mode} ($)", tickfont=dict(family="Arial"))
     ))
 
-    # --- TEXT LOGIC ---
     font_size = 11
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             label = f"${val/1e3:,.1f}K"
-            
-            # Strict Logic: White < 0, Black > 0, Yellow == 0
             if val < 0: t_color = "white"
             elif val > 0: t_color = "black"
             else: t_color = "yellow"
@@ -182,46 +181,49 @@ def render_heatmap(df, ticker, S, mode):
     return fig
 
 # -------------------------
-# Dashboard Fragment
+# Main Logic
 # -------------------------
 @st.fragment(run_every="60s")
 def dashboard_content(ticker, max_exp, s_range):
     tz_est = pytz.timezone('US/Eastern')
     now_est = datetime.now(pytz.utc).astimezone(tz_est)
-    st.write(f"🕒 Last updated: **{now_est.strftime('%H:%M:%S')} EST** (Auto-refresh: 60s)")
+    st.write(f"🕒 Last updated: **{now_est.strftime('%H:%M:%S')} EST**")
     
-    with st.spinner("Analyzing market greeks..."):
+    with st.spinner("Fetching market data..."):
         S, raw_df = fetch_data(ticker, int(max_exp))
         
     if S and raw_df is not None:
         df = process_exposure(raw_df, S, s_range)
         if not df.empty:
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Net GEX", f"${df['gex'].sum()/1e9:,.2f}B")
             m2.metric("Net VANEX", f"${df['vanex'].sum()/1e6:,.1f}M")
-            m3.metric("Calls OI", f"{df[df['type']=='call']['oi'].sum():,.0f}")
-            m4.metric("Puts OI", f"{df[df['type']=='put']['oi'].sum():,.0f}")
-            p_oi = df[df['type']=='put']['oi'].sum()
-            m5.metric("C/P Ratio", f"{(df[df['type']=='call']['oi'].sum()/p_oi):.2f}" if p_oi > 0 else "0")
+            m3.metric("Total OI", f"{df['oi'].sum():,.0f}")
+            m4.metric("Spot Price", f"${S:,.2f}")
 
             st.markdown("---")
-            col_gex, col_van = st.columns(2)
-            with col_gex:
-                st.markdown("### 🟢 GEX Exposure (Gamma)")
+            c1, c2 = st.columns(2)
+            with c1:
                 st.plotly_chart(render_heatmap(df, ticker, S, "GEX"), use_container_width=True)
-            with col_van:
-                st.markdown("### 🟠 VANEX Exposure (Vanna)")
+            with c2:
                 st.plotly_chart(render_heatmap(df, ticker, S, "VANEX"), use_container_width=True)
-        else: st.warning("No data found in this strike range.")
-    else: st.error("Failed to fetch data from API.")
+
+            # --- DIAGNOSTICS TABLE ---
+            with st.expander("🔍 Data Diagnostics (Raw Greeks per Strike)"):
+                st.write("If VANEX is 0, check if 'vega_raw' or 'iv_raw' are zero below.")
+                diag_df = df[['strike', 'expiry', 'type', 'oi', 'vega_raw', 'iv_raw', 'vanex']].copy()
+                st.dataframe(diag_df.sort_values(by='strike', ascending=False), use_container_width=True)
+        else:
+            st.warning("No data found. Try increasing the 'Strike ±' range.")
+    else:
+        st.error("API error. Verify your Tradier Token.")
 
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX / VANEX Pro Analytics</h2>", unsafe_allow_html=True)
-    c1, c2, c3, _ = st.columns([1.5, 1, 1, 0.8], vertical_alignment="bottom")
-    ticker = c1.text_input("Ticker", value="SPY").upper().strip()
-    max_exp = c2.number_input("Expiries", 1, 15, 5)
-    s_range = c3.number_input("Strike ±", 5, 500, 80 if ticker in ["SPX", "SPXW"] else 25)
-    
+    cols = st.columns([1.5, 1, 1])
+    ticker = cols[0].text_input("Ticker", value="SPY").upper().strip()
+    max_exp = cols[1].number_input("Expiries", 1, 15, 5)
+    s_range = cols[2].number_input("Strike ±", 5, 500, 25)
     dashboard_content(ticker, max_exp, s_range)
 
 if __name__ == "__main__":
