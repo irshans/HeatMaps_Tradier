@@ -51,13 +51,16 @@ def tradier_get(endpoint, params):
 def get_market_days():
     open_days = set()
     dt = datetime.now()
-    cal = tradier_get("markets/calendar", {"month": dt.month, "year": dt.year})
-    try:
-        days = cal['calendar']['days']['day']
-        if isinstance(days, dict): days = [days]
-        for d in days:
-            if d.get('status') == 'open': open_days.add(d.get('date'))
-    except: pass
+    # Pull current and next month calendars to ensure we have enough days
+    for month_offset in [0, 1]:
+        target_dt = dt if month_offset == 0 else (dt.replace(day=1) + pd.DateOffset(months=1))
+        cal = tradier_get("markets/calendar", {"month": target_dt.month, "year": target_dt.year})
+        try:
+            days = cal['calendar']['days']['day']
+            if isinstance(days, dict): days = [days]
+            for d in days:
+                if d.get('status') == 'open': open_days.add(d.get('date'))
+        except: pass
     return open_days
 
 def fetch_data(ticker, max_exp):
@@ -71,13 +74,15 @@ def fetch_data(ticker, max_exp):
     if not exp_data: return S, None
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): all_exps = [all_exps]
-    valid_exps = [exp for exp in all_exps if exp in open_days][:max_exp]
+    
+    # Filter only for days markets are actually open
+    valid_exps = sorted([exp for exp in all_exps if exp in open_days])[:max_exp]
     
     dfs = []
     prog = st.progress(0, text="Fetching data...")
     for i, exp in enumerate(valid_exps):
         chain = tradier_get("markets/options/chains", {"symbol": ticker, "expiration": exp, "greeks": "true"})
-        if chain and 'options' in chain and chain['options']['option']:
+        if chain and 'options' in chain and chain['options'] and chain['options']['option']:
             opts = chain['options']['option']
             dfs.append(pd.DataFrame(opts) if isinstance(opts, list) else pd.DataFrame([opts]))
         prog.progress((i + 1) / len(valid_exps))
@@ -105,7 +110,10 @@ def process_exposure(df, S, s_range):
     return pd.DataFrame(res)
 
 def render_heatmap(df, ticker, S, mode):
-    pivot = df.pivot_table(index='strike', columns='expiry', values=mode.lower(), aggfunc='sum').sort_index(ascending=False).fillna(0)
+    # Ensure chronological column sorting
+    pivot = df.pivot_table(index='strike', columns='expiry', values=mode.lower(), aggfunc='sum')
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1).sort_index(ascending=False).fillna(0)
+    
     z, x_labs, y_labs = pivot.values, pivot.columns.tolist(), pivot.index.tolist()
     abs_limit = np.max(np.abs(z)) if z.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
@@ -118,7 +126,12 @@ def render_heatmap(df, ticker, S, mode):
             label = f"${val/1e6:.1f}M" if abs(val) >= 1e6 else (f"${val/1e3:.0f}K" if abs(val) >= 1e3 else f"${val:.0f}")
             fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color="white" if val < 0 else "black", size=10, family="Arial Black"))
 
-    fig.update_layout(title=f"{ticker} {mode} Matrix", template="plotly_dark", height=700, xaxis=dict(side='top'), yaxis=dict(ticktext=[f"➔ <b>{s}</b>" if s == closest_strike else str(s) for s in y_labs], tickvals=y_labs))
+    fig.update_layout(
+        title=f"{ticker} {mode} Matrix", 
+        template="plotly_dark", height=700, 
+        xaxis=dict(side='top', type='category', categoryorder='array', categoryarray=x_labs), 
+        yaxis=dict(ticktext=[f"➔ <b>{s}</b>" if s == closest_strike else str(s) for s in y_labs], tickvals=y_labs)
+    )
     return fig
 
 # -------------------------
