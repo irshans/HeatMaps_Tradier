@@ -126,8 +126,6 @@ def render_heatmap(df, ticker, S, mode):
     z_raw, x_labs, y_labs = pivot.values, pivot.columns.tolist(), pivot.index.tolist()
     
     abs_limit = np.max(np.abs(z_raw)) if z_raw.size > 0 else 1.0
-    # Use dynamic threshold (10% of max) so annotations scale between GEX and VEX
-    threshold = abs_limit * 0.1 
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
 
     fig = go.Figure(data=go.Heatmap(
@@ -139,14 +137,18 @@ def render_heatmap(df, ticker, S, mode):
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
-            if abs(val) < threshold: continue
+            # Removed the threshold so ALL values show. 
+            # We skip exactly 0 to keep the chart readable.
+            if val == 0: continue
             
-            # Format labels intelligently based on size
-            if abs(val) >= 1e6: label = f"${val/1e6:.1f}M"
-            else: label = f"${val/1e3:,.0f}K"
+            # Forced "Thousands" ($K) formatting as requested
+            label = f"${val/1e3:,.0f}K"
             
             t_color = "black" if val >= 0 else "white"
-            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color=t_color, size=10))
+            fig.add_annotation(
+                x=exp, y=strike, text=label, showarrow=False, 
+                font=dict(color=t_color, size=9) # Slightly smaller font to fit more labels
+            )
 
     calc_height = max(600, len(y_labs) * 25)
     fig.update_layout(
@@ -189,7 +191,6 @@ def render_gamma_bar(df, S):
 # -------------------------
 @st.fragment(run_every="60s")
 def dashboard_content(ticker, max_exp, s_range):
-    # Timezone handling for EST
     tz_est = pytz.timezone('US/Eastern')
     now_est = datetime.now(pytz.utc).astimezone(tz_est)
     
@@ -201,7 +202,6 @@ def dashboard_content(ticker, max_exp, s_range):
     if S and raw_df is not None:
         df = process_exposure(raw_df, S, s_range)
         if not df.empty:
-            # Metric Bar
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Net GEX", f"${df['gex'].sum()/1e9:,.2f}B")
             m2.metric("Net VEX", f"${df['vex'].sum()/1e6:,.1f}M")
@@ -212,7 +212,6 @@ def dashboard_content(ticker, max_exp, s_range):
 
             st.markdown("---")
             
-            # Side-by-Side Heatmaps
             col_gex, col_vex = st.columns(2)
             with col_gex:
                 st.markdown("### 🟢 GEX Exposure (Gamma)")
@@ -223,7 +222,6 @@ def dashboard_content(ticker, max_exp, s_range):
             
             st.markdown("---")
             
-            # Structural Walls
             bar_fig = render_gamma_bar(df, S)
             if bar_fig: 
                 st.plotly_chart(bar_fig, use_container_width=True)
@@ -235,12 +233,9 @@ def dashboard_content(ticker, max_exp, s_range):
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX / VEX Pro Analytics</h2>", unsafe_allow_html=True)
     
-    # Header Inputs
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8], vertical_alignment="bottom")
-    
     ticker = c1.text_input("Ticker", value="SPY").upper().strip()
     
-    # Auto-adjust defaults for SPX
     is_spx = ticker in ["SPX", "SPXW"]
     max_exp = c2.number_input("Expiries", 1, 15, 5)
     s_range = c3.number_input("Strike ±", 5, 500, 80 if is_spx else 25)
