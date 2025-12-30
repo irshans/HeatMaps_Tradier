@@ -96,27 +96,47 @@ def process_exposure(df, S, s_range):
     for _, row in df.iterrows():
         g = row.get('greeks')
         if not g: continue
-        gamma, vega = float(g.get('gamma', 0) or 0), float(g.get('vega', 0) or 0)
+        
+        gamma = float(g.get('gamma', 0) or 0)
+        vega = float(g.get('vega', 0) or 0)
         delta = float(g.get('delta', 0) or 0)
+        
         iv = float(g.get('smv_vol') or g.get('mid_iv') or 0)
         if iv > 1.0: iv /= 100.0
-        oi, side = int(row.get('open_interest', 0) or 0), (1 if row['option_type'].lower() == 'call' else -1)
-
+        
+        oi = int(row.get('open_interest', 0) or 0)
+        side = 1 if row['option_type'].lower() == 'call' else -1
+        K = float(row['strike'])
+        
+        # Standard GEX calculation
         gex = side * gamma * (S**2) * 0.01 * 100 * oi
-        vanna_raw = vega / (S * iv) if (S > 0 and iv > 0) else 0
-        vanex = side * vanna_raw * S * 0.01 * 100 * oi
-        dex = -delta * 100 * oi  # Dealer Delta (Assuming dealer is short the option)
+        
+        # Improved Vanna approximation: Vanna ≈ Vega * Delta / (S * σ)
+        if S > 0 and iv > 0:
+            vanna_raw = (vega * delta) / (S * iv)
+        else:
+            vanna_raw = 0
+        
+        vanex = side * vanna_raw * 100 * oi
+        
+        # DEX: Positive for net long delta exposure dealers must hedge
+        dex = -side * delta * 100 * oi
+        
+        # Validate calculations
+        if not np.isfinite([gex, vanex, dex]).all():
+            continue
         
         res.append({
-            "strike": row['strike'], 
-            "expiry": row['expiration_date'], 
-            "gex": gex, 
-            "vanex": vanex, 
+            "strike": K,
+            "expiry": row['expiration_date'],
+            "gex": gex,
+            "vanex": vanex,
             "dex": dex,
             "gamma": gamma * side * oi,
-            "type": row['option_type'].lower(), 
+            "type": row['option_type'].lower(),
             "oi": oi
         })
+    
     return pd.DataFrame(res)
 
 def find_gamma_flip(df):
@@ -180,30 +200,122 @@ def main():
                 m4.metric("Spot Price", f"${S:,.2f}")
 
                 st.markdown("---")
+                
+                # --- BAR CHARTS ---
+                col_bar1, col_bar2 = st.columns(2)
+                
+                # Get strikes within ±10 of spot for bar charts
+                bar_range = 10
+                df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range)].copy()
+                
+                if not df_bar.empty:
+                    # A) GEX Concentrations by Strike
+                    with col_bar1:
+                        gex_by_strike = df_bar.groupby('strike')['gex'].sum().sort_index()
+                        
+                        fig_gex = go.Figure()
+                        colors = ['#2ecc71' if v > 0 else '#e74c3c' for v in gex_by_strike.values]
+                        
+                        fig_gex.add_trace(go.Bar(
+                            x=gex_by_strike.index,
+                            y=gex_by_strike.values,
+                            marker_color=colors,
+                            text=[f"${v/1e6:.2f}M" if abs(v) >= 1e6 else f"${v/1e3:.0f}K" for v in gex_by_strike.values],
+                            textposition='outside',
+                            textfont=dict(size=10, family="Arial Black"),
+                            hovertemplate='Strike: $%{x}<br>GEX: $%{y:,.0f}<extra></extra>'
+                        ))
+                        
+                        fig_gex.add_vline(x=S, line_dash="dash", line_color="yellow", 
+                                         annotation_text=f"Spot ${S:.2f}", annotation_position="top")
+                        
+                        fig_gex.update_layout(
+                            title=f"GEX Concentration (±${bar_range})",
+                            template="plotly_dark",
+                            height=350,
+                            showlegend=False,
+                            xaxis_title="Strike Price",
+                            yaxis_title="Gamma Exposure ($)",
+                            margin=dict(l=20, r=20, t=60, b=20)
+                        )
+                        
+                        st.plotly_chart(fig_gex, use_container_width=True)
+                    
+                    # B) Options Inventory (OI) by Strike
+                    with col_bar2:
+                        oi_by_strike = df_bar.groupby(['strike', 'type'])['oi'].sum().unstack(fill_value=0)
+                        
+                        fig_oi = go.Figure()
+                        
+                        if 'call' in oi_by_strike.columns:
+                            fig_oi.add_trace(go.Bar(
+                                name='Calls',
+                                x=oi_by_strike.index,
+                                y=oi_by_strike['call'],
+                                marker_color='#3498db',
+                                text=[f"{int(v):,}" for v in oi_by_strike['call'].values],
+                                textposition='outside',
+                                textfont=dict(size=10, family="Arial Black"),
+                                hovertemplate='Strike: $%{x}<br>Call OI: %{y:,}<extra></extra>'
+                            ))
+                        
+                        if 'put' in oi_by_strike.columns:
+                            fig_oi.add_trace(go.Bar(
+                                name='Puts',
+                                x=oi_by_strike.index,
+                                y=oi_by_strike['put'],
+                                marker_color='#e67e22',
+                                text=[f"{int(v):,}" for v in oi_by_strike['put'].values],
+                                textposition='outside',
+                                textfont=dict(size=10, family="Arial Black"),
+                                hovertemplate='Strike: $%{x}<br>Put OI: %{y:,}<extra></extra>'
+                            ))
+                        
+                        fig_oi.add_vline(x=S, line_dash="dash", line_color="yellow",
+                                        annotation_text=f"Spot ${S:.2f}", annotation_position="top")
+                        
+                        fig_oi.update_layout(
+                            title=f"Options Inventory (±${bar_range})",
+                            template="plotly_dark",
+                            height=350,
+                            barmode='group',
+                            xaxis_title="Strike Price",
+                            yaxis_title="Open Interest",
+                            margin=dict(l=20, r=20, t=60, b=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        
+                        st.plotly_chart(fig_oi, use_container_width=True)
+                
+                st.markdown("---")
+                
                 col_gex, col_van = st.columns(2)
-                with col_gex: st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), width="stretch")
-                with col_van: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), width="stretch")
+                with col_gex: st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
+                with col_van: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), use_container_width=True)
 
                 # --- DIAGNOSTIC TABLE ---
                 st.markdown("### 🔍 Strike Diagnostics (5 Closest to Spot)")
                 
-                strike_diag = df.groupby('strike').agg({
-                    'gex': [('Call GEX', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
-                            ('Put GEX', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
-                            ('Net GEX', 'sum')],
-                    'vanex': [('Call Vanna', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
-                              ('Put Vanna', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
-                              ('Net Vanna', 'sum')],
-                    'gamma': [('Call Gamma', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
-                              ('Put Gamma', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
-                              ('Net Gamma', 'sum')],
-                    'dex': [('Dealer Delta', 'sum')]
-                })
+                # Create separate dataframes for calls and puts
+                df_calls = df[df['type'] == 'call']
+                df_puts = df[df['type'] == 'put']
+
+                strike_diag = pd.DataFrame({
+                    'Call GEX': df_calls.groupby('strike')['gex'].sum(),
+                    'Put GEX': df_puts.groupby('strike')['gex'].sum(),
+                    'Net GEX': df.groupby('strike')['gex'].sum(),
+                    'Call Vanna': df_calls.groupby('strike')['vanex'].sum(),
+                    'Put Vanna': df_puts.groupby('strike')['vanex'].sum(),
+                    'Net Vanna': df.groupby('strike')['vanex'].sum(),
+                    'Call Gamma': df_calls.groupby('strike')['gamma'].sum(),
+                    'Put Gamma': df_puts.groupby('strike')['gamma'].sum(),
+                    'Net Gamma': df.groupby('strike')['gamma'].sum(),
+                    'Dealer Delta': df.groupby('strike')['dex'].sum()
+                }).fillna(0)
                 
-                strike_diag.columns = [c[1] for c in strike_diag.columns]
                 strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
                 
-                # FIXED: Using np.abs to avoid Index object error
+                # Using np.abs to avoid Index object error
                 dist_idx = np.abs(strike_diag.index - S).argsort()[:5]
                 closest_strikes = strike_diag.iloc[dist_idx].sort_index(ascending=False)
 
@@ -218,7 +330,7 @@ def main():
                         'Call Gamma': '{:,.2f}', 'Put Gamma': '{:,.2f}', 'Net Gamma': '{:,.2f}',
                         'Dealer Delta': '{:,.0f}', 'Dist %': '{:.2f}%'
                     }).map(color_greeks, subset=['Net GEX', 'Net Vanna', 'Net Gamma', 'Dealer Delta']),
-                    width="stretch"
+                    use_container_width=True
                 )
             else: st.warning("No data in range.")
         else: st.error("API Error.")
