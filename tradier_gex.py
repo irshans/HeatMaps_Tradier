@@ -160,36 +160,38 @@ def render_heatmap(df, ticker, S, mode):
         colorbar=dict(title=f"{mode} ($)", tickfont=dict(family="Arial"))
     ))
 
-    # Calculate dynamic font size based on strike count
-    font_size = max(7, min(10, int(150 / max(1, len(y_labs)))))
+    # --- TEXT LOGIC UPDATED ---
+    # Fixed font size to 11 for better legibility
+    font_size = 11 
 
-    # Add Annotations
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
-            if val == 0: continue
             
-            # Format in Thousands as requested
+            # Formatting as Thousands ($K)
             label = f"${val/1e3:,.1f}K"
             
-            # Smart Contrast logic
-            norm = (val + abs_limit) / (2 * abs_limit)
-            t_color = "black" if 0.4 < norm < 0.9 else "white"
+            # Logic: White for negatives, Black for positives, Yellow for zero
+            if val < 0:
+                t_color = "white"
+            elif val > 0:
+                t_color = "black"
+            else:
+                t_color = "yellow"
 
             fig.add_annotation(
                 x=exp, y=strike,
                 text=label, showarrow=False,
-                font=dict(color=t_color, size=font_size)
+                font=dict(color=t_color, size=font_size, family="Arial Black")
             )
 
-    calc_height = max(600, len(y_labs) * 25)
+    calc_height = max(600, len(y_labs) * 30) # Slightly more height per row
 
-    # FINAL FIX: cliponaxis removed from both add_annotation and update_layout
     fig.update_layout(
         title=f"{ticker} {mode} Matrix | Spot: ${S:,.2f}",
         template="plotly_dark",
         height=calc_height,
-        margin=dict(t=50, b=50, l=50, r=50),
+        margin=dict(t=50, b=50, l=60, r=50),
         font=dict(family="Arial"),
         xaxis=dict(type='category', side='top'),
         yaxis=dict(
