@@ -13,10 +13,9 @@ st.markdown("""
     <style>
     * { font-family: 'Arial', sans-serif !important; }
     .block-container { padding-top: 24px; padding-bottom: 8px; }
-    [data-testid="stMetricValue"] { font-size: 22px !important; font-family: 'Arial' !important; }
+    [data-testid="stMetricValue"] { font-size: 20px !important; font-family: 'Arial' !important; }
     h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; font-weight: bold; }
     hr { margin: 15px 0 !important; }
-    /* Styling the diagnostic table */
     [data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 10px; }
     </style>
     """, unsafe_allow_html=True)
@@ -98,20 +97,25 @@ def process_exposure(df, S, s_range):
         g = row.get('greeks')
         if not g: continue
         gamma, vega = float(g.get('gamma', 0) or 0), float(g.get('vega', 0) or 0)
+        delta = float(g.get('delta', 0) or 0)
         iv = float(g.get('smv_vol') or g.get('mid_iv') or 0)
         if iv > 1.0: iv /= 100.0
         oi, side = int(row.get('open_interest', 0) or 0), (1 if row['option_type'].lower() == 'call' else -1)
 
+        # Dealer Exposure Calculations (assuming dealer is SHORT the option)
+        # Note: Dealer Delta = - (Option Delta) * OI * 100
         gex = side * gamma * (S**2) * 0.01 * 100 * oi
         vanna_raw = vega / (S * iv) if (S > 0 and iv > 0) else 0
         vanex = side * vanna_raw * S * 0.01 * 100 * oi
+        dex = -delta * 100 * oi  # Dealer Delta Exposure
         
         res.append({
             "strike": row['strike'], 
             "expiry": row['expiration_date'], 
             "gex": gex, 
             "vanex": vanex, 
-            "gamma": gamma * side * oi, # Raw dealer gamma
+            "dex": dex,
+            "gamma": gamma * side * oi,
             "type": row['option_type'].lower(), 
             "oi": oi
         })
@@ -121,7 +125,7 @@ def find_gamma_flip(df):
     if df.empty: return None
     strike_sums = df.groupby('strike')['gex'].sum().sort_index()
     for i in range(len(strike_sums) - 1):
-        if (strike_sums.iloc[i] < 0 and strike_sums.iloc[i+1] > 0) or (strike_sums.iloc[i] > 0 and strike_sums.iloc[i+1] < 0):
+        if (strike_sums.iloc[i] * strike_sums.iloc[i+1]) < 0:
             return strike_sums.index[i] if abs(strike_sums.iloc[i]) < abs(strike_sums.iloc[i+1]) else strike_sums.index[i+1]
     return None
 
@@ -139,11 +143,13 @@ def render_heatmap(df, ticker, S, mode, flip_strike):
         for j, exp in enumerate(x_labs):
             val = z[i, j]
             label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
-            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color="white" if val < 0 else "black", size=10, family="Arial Black"))
+            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color="white" if val < 0 else "black", size=9, family="Arial Black"))
 
     y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
 
-    fig.update_layout(title=f"{ticker} {mode} Matrix", template="plotly_dark", height=700, xaxis=dict(side='top', type='category'), yaxis=dict(ticktext=y_text, tickvals=y_labs))
+    fig.update_layout(title=f"{ticker} {mode} Matrix", template="plotly_dark", height=650, 
+                      margin=dict(l=80, r=20, t=80, b=20),
+                      xaxis=dict(side='top', type='category'), yaxis=dict(ticktext=y_text, tickvals=y_labs))
     return fig
 
 # -------------------------
@@ -158,8 +164,7 @@ def main():
     s_range = c3.number_input("Strike ±", 5, 500, 25)
     refresh = c4.button("🔄 Refresh Data")
 
-    if refresh:
-        st.cache_data.clear()
+    if refresh: st.cache_data.clear()
 
     @st.fragment(run_every="600s")
     def dashboard_content():
@@ -168,24 +173,21 @@ def main():
             df = process_exposure(raw_df, S, s_range)
             if not df.empty:
                 flip_strike = find_gamma_flip(df)
+                total_dex = df['dex'].sum()
                 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Net GEX", f"${df['gex'].sum():,.0f}")
-                m2.metric("Net VANEX", f"${df['vanex'].sum():,.0f}")
+                m2.metric("Net Dealer Delta (DEX)", f"{total_dex/1e6:.1f}M Shrs", delta=f"{'Short' if total_dex < 0 else 'Long'} Hedged")
                 m3.metric("Gamma Flip", f"${flip_strike:,.0f}" if flip_strike else "N/A")
                 m4.metric("Spot Price", f"${S:,.2f}")
 
                 st.markdown("---")
                 col_gex, col_van = st.columns(2)
-                with col_gex:
-                    st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), width="stretch")
-                with col_van:
-                    st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), width="stretch")
+                with col_gex: st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
+                with col_van: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), use_container_width=True)
 
-                # --- NEW DIAGNOSTIC TABLE ---
-                st.markdown("### 🔍 Top 5 Strikes Closest to Spot")
+                st.markdown("### 🔍 Strike Diagnostics & Hedging Profile")
                 
-                # Aggregate data by strike
                 strike_diag = df.groupby('strike').agg({
                     'gex': [('Call GEX', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
                             ('Put GEX', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
@@ -195,25 +197,30 @@ def main():
                               ('Net Vanna', 'sum')],
                     'gamma': [('Call Gamma', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
                               ('Put Gamma', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
-                              ('Net Gamma', 'sum')]
+                              ('Net Gamma', 'sum')],
+                    'dex': [('Dealer Delta', 'sum')]
                 })
                 
-                # Flatten columns and find 5 closest to spot
                 strike_diag.columns = [c[1] for c in strike_diag.columns]
                 strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
-                closest_strikes = strike_diag.iloc[(strike_diag.index - S).abs().argsort()[:5]].sort_index(ascending=False)
+                
+                # Closest to spot fix
+                dist_from_spot = (strike_diag.index - S).to_series().abs()
+                closest_strikes = strike_diag.iloc[dist_from_spot.argsort()[:5]].sort_index(ascending=False)
 
-                # Format and Color
                 def color_greeks(val):
                     color = '#2ecc71' if val > 0 else '#e74c3c'
                     return f'color: {color}'
 
                 st.dataframe(
-                    closest_strikes.style.format("${:,.0f}")
-                    .applymap(color_greeks, subset=['Net GEX', 'Net Vanna', 'Net Gamma']),
+                    closest_strikes.style.format({
+                        'Call GEX': '${:,.0f}', 'Put GEX': '${:,.0f}', 'Net GEX': '${:,.0f}',
+                        'Call Vanna': '${:,.0f}', 'Put Vanna': '${:,.0f}', 'Net Vanna': '${:,.0f}',
+                        'Call Gamma': '{:,.2f}', 'Put Gamma': '{:,.2f}', 'Net Gamma': '{:,.2f}',
+                        'Dealer Delta': '{:,.0f}', 'Dist %': '{:.2f}%'
+                    }).map(color_greeks, subset=['Net GEX', 'Net Vanna', 'Net Gamma', 'Dealer Delta']),
                     width="stretch"
                 )
-                
             else: st.warning("No data in range.")
         else: st.error("API Error.")
 
