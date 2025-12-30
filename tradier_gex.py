@@ -142,7 +142,7 @@ def process_exposure(df, S, s_range):
 def smart_fill_strikes(df, S):
     """Auto-detect strike interval and fill missing strikes for uniform heatmap"""
     if df.empty:
-        return df
+        return df, 5, 25  # Return defaults
     
     # Detect actual interval in data
     strikes = sorted(df['strike'].unique())
@@ -153,15 +153,18 @@ def smart_fill_strikes(df, S):
     else:
         common_interval = 5
     
-    # Round to nearest standard interval
+    # Round to nearest standard interval and set recommended strike range
     if common_interval <= 1:
         interval = 1
+        recommended_range = 25
     elif common_interval <= 2.5:
         interval = 2.5
+        recommended_range = 45
     else:
         interval = 5
+        recommended_range = 80
     
-    st.info(f"📊 Detected strike interval: ${interval} | Filling gaps for uniform display")
+    st.info(f"📊 Detected strike interval: ${interval} | Recommended range: ±${recommended_range}")
     
     # Create complete strike range
     min_strike = df['strike'].min()
@@ -209,7 +212,7 @@ def smart_fill_strikes(df, S):
     df_final['oi'] = df_final['oi_typed'].fillna(df_final['oi'])
     df_final = df_final.drop(columns=['oi_typed'], errors='ignore')
     
-    return df_final
+    return df_final, interval, recommended_range
 
 def find_gamma_flip(df):
     if df.empty: return None
@@ -226,6 +229,16 @@ def render_heatmap(df, ticker, S, mode, flip_strike):
     z, x_labs, y_labs = pivot.values, pivot.columns.tolist(), pivot.index.tolist()
     abs_limit = np.max(np.abs(z)) if z.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
+    
+    # Find highest absolute GEX value for star marker (only for GEX mode)
+    max_abs_val = 0
+    max_abs_pos = None
+    if mode.upper() == "GEX":
+        for i, strike in enumerate(y_labs):
+            for j, exp in enumerate(x_labs):
+                if abs(z[i, j]) > max_abs_val:
+                    max_abs_val = abs(z[i, j])
+                    max_abs_pos = (i, j)
 
     fig = go.Figure(data=go.Heatmap(
         z=z, 
@@ -243,6 +256,11 @@ def render_heatmap(df, ticker, S, mode, flip_strike):
         for j, exp in enumerate(x_labs):
             val = z[i, j]
             label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
+            
+            # Add star to highest absolute GEX value
+            if mode.upper() == "GEX" and max_abs_pos and (i, j) == max_abs_pos:
+                label += " ⭐"
+            
             fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, 
                              font=dict(color="white" if val < 0 else "black", size=9, family="Arial Black"))
 
@@ -267,7 +285,12 @@ def main():
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1], vertical_alignment="bottom")
     ticker = c1.text_input("Ticker", value="SPY").upper().strip()
     max_exp = c2.number_input("Expiries", 1, 15, 5)
-    s_range = c3.number_input("Strike ±", 5, 500, 25)
+    
+    # Dynamic default for strike range - will be updated after data fetch
+    if 'default_strike_range' not in st.session_state:
+        st.session_state.default_strike_range = 25
+    
+    s_range = c3.number_input("Strike ±", 5, 500, st.session_state.default_strike_range)
     refresh = c4.button("🔄 Refresh Data")
 
     if refresh: st.cache_data.clear()
@@ -279,7 +302,10 @@ def main():
             df = process_exposure(raw_df, S, s_range)
             if not df.empty:
                 # Apply smart strike filling for uniform heatmap
-                df = smart_fill_strikes(df, S)
+                df, interval, recommended_range = smart_fill_strikes(df, S)
+                
+                # Update session state with recommended range for next refresh
+                st.session_state.default_strike_range = recommended_range
                 
                 flip_strike = find_gamma_flip(df)
                 total_dex = df['dex'].sum()
@@ -300,39 +326,40 @@ def main():
                 df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range) & (df['oi'] > 0)].copy()
                 
                 if not df_bar.empty:
-                    # A) GEX Concentrations by Strike
+                    # A) GEX Concentrations by Strike - HORIZONTAL BARS
                     with col_bar1:
-                        gex_by_strike = df_bar.groupby('strike')['gex'].sum().sort_index()
+                        gex_by_strike = df_bar.groupby('strike')['gex'].sum().sort_index(ascending=True)
                         
                         fig_gex = go.Figure()
                         colors = ['#2ecc71' if v > 0 else '#e74c3c' for v in gex_by_strike.values]
                         
                         fig_gex.add_trace(go.Bar(
-                            x=gex_by_strike.index,
-                            y=gex_by_strike.values,
+                            y=gex_by_strike.index,
+                            x=gex_by_strike.values,
+                            orientation='h',
                             marker_color=colors,
                             text=[f"${v/1e6:.2f}M" if abs(v) >= 1e6 else f"${v/1e3:.0f}K" for v in gex_by_strike.values],
                             textposition='outside',
-                            textfont=dict(size=10, family="Arial Black"),
-                            hovertemplate='Strike: $%{x}<br>GEX: $%{y:,.0f}<extra></extra>'
+                            textfont=dict(size=11, family="Arial Black"),
+                            hovertemplate='Strike: $%{y}<br>GEX: $%{x:,.0f}<extra></extra>'
                         ))
                         
-                        fig_gex.add_vline(x=S, line_dash="dash", line_color="yellow", 
-                                         annotation_text=f"Spot ${S:.2f}", annotation_position="top")
+                        fig_gex.add_hline(y=S, line_dash="dash", line_color="yellow", 
+                                         annotation_text=f"Spot ${S:.2f}", annotation_position="right")
                         
                         fig_gex.update_layout(
                             title=f"GEX Concentration (±${bar_range})",
                             template="plotly_dark",
                             height=350,
                             showlegend=False,
-                            xaxis_title="Strike Price",
-                            yaxis_title="Gamma Exposure ($)",
-                            margin=dict(l=20, r=20, t=60, b=20)
+                            yaxis_title="Strike Price",
+                            xaxis_title="Gamma Exposure ($)",
+                            margin=dict(l=60, r=80, t=60, b=20)
                         )
                         
                         st.plotly_chart(fig_gex, use_container_width=True)
                     
-                    # B) Options Inventory (OI) by Strike
+                    # B) Options Inventory (OI) by Strike - HORIZONTAL BARS
                     with col_bar2:
                         # Filter out 'filled' type entries for OI chart
                         df_bar_real = df_bar[df_bar['type'] != 'filled']
@@ -343,38 +370,40 @@ def main():
                         if 'call' in oi_by_strike.columns:
                             fig_oi.add_trace(go.Bar(
                                 name='Calls',
-                                x=oi_by_strike.index,
-                                y=oi_by_strike['call'],
+                                y=oi_by_strike.index,
+                                x=oi_by_strike['call'],
+                                orientation='h',
                                 marker_color='#3498db',
                                 text=[f"{int(v):,}" for v in oi_by_strike['call'].values],
                                 textposition='outside',
-                                textfont=dict(size=10, family="Arial Black"),
-                                hovertemplate='Strike: $%{x}<br>Call OI: %{y:,}<extra></extra>'
+                                textfont=dict(size=11, family="Arial Black"),
+                                hovertemplate='Strike: $%{y}<br>Call OI: %{x:,}<extra></extra>'
                             ))
                         
                         if 'put' in oi_by_strike.columns:
                             fig_oi.add_trace(go.Bar(
                                 name='Puts',
-                                x=oi_by_strike.index,
-                                y=oi_by_strike['put'],
+                                y=oi_by_strike.index,
+                                x=oi_by_strike['put'],
+                                orientation='h',
                                 marker_color='#e67e22',
                                 text=[f"{int(v):,}" for v in oi_by_strike['put'].values],
                                 textposition='outside',
-                                textfont=dict(size=10, family="Arial Black"),
-                                hovertemplate='Strike: $%{x}<br>Put OI: %{y:,}<extra></extra>'
+                                textfont=dict(size=11, family="Arial Black"),
+                                hovertemplate='Strike: $%{y}<br>Put OI: %{x:,}<extra></extra>'
                             ))
                         
-                        fig_oi.add_vline(x=S, line_dash="dash", line_color="yellow",
-                                        annotation_text=f"Spot ${S:.2f}", annotation_position="top")
+                        fig_oi.add_hline(y=S, line_dash="dash", line_color="yellow",
+                                        annotation_text=f"Spot ${S:.2f}", annotation_position="right")
                         
                         fig_oi.update_layout(
                             title=f"Options Inventory (±${bar_range})",
                             template="plotly_dark",
                             height=350,
-                            barmode='group',
-                            xaxis_title="Strike Price",
-                            yaxis_title="Open Interest",
-                            margin=dict(l=20, r=20, t=60, b=20),
+                            barmode='stack',
+                            yaxis_title="Strike Price",
+                            xaxis_title="Open Interest",
+                            margin=dict(l=60, r=80, t=60, b=20),
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                         )
                         
