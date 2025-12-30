@@ -344,17 +344,25 @@ def main():
                             hovertemplate='Strike: $%{y}<br>GEX: $%{x:,.0f}<extra></extra>'
                         ))
                         
-                        fig_gex.add_hline(y=S, line_dash="dash", line_color="yellow", 
-                                         annotation_text=f"Spot ${S:.2f}", annotation_position="right")
+                        # Add horizontal line for spot price
+                        fig_gex.add_hline(y=S, line_dash="dash", line_color="yellow", line_width=2)
+                        
+                        # Create custom y-axis labels with arrow for spot
+                        y_labels = [f"➔ <b>${s:.2f}</b>" if abs(s - S) < 0.01 else f"${s:.2f}" 
+                                   for s in gex_by_strike.index]
                         
                         fig_gex.update_layout(
                             title=f"GEX Concentration (±${bar_range})",
                             template="plotly_dark",
                             height=350,
                             showlegend=False,
-                            yaxis_title="Strike Price",
+                            yaxis=dict(
+                                title="Strike Price",
+                                ticktext=y_labels,
+                                tickvals=gex_by_strike.index
+                            ),
                             xaxis_title="Gamma Exposure ($)",
-                            margin=dict(l=60, r=80, t=60, b=20)
+                            margin=dict(l=80, r=80, t=60, b=20)
                         )
                         
                         st.plotly_chart(fig_gex, use_container_width=True)
@@ -393,17 +401,25 @@ def main():
                                 hovertemplate='Strike: $%{y}<br>Put OI: %{x:,}<extra></extra>'
                             ))
                         
-                        fig_oi.add_hline(y=S, line_dash="dash", line_color="yellow",
-                                        annotation_text=f"Spot ${S:.2f}", annotation_position="right")
+                        # Add horizontal line for spot price
+                        fig_oi.add_hline(y=S, line_dash="dash", line_color="yellow", line_width=2)
+                        
+                        # Create custom y-axis labels with arrow for spot
+                        y_labels_oi = [f"➔ <b>${s:.2f}</b>" if abs(s - S) < 0.01 else f"${s:.2f}" 
+                                      for s in oi_by_strike.index]
                         
                         fig_oi.update_layout(
                             title=f"Options Inventory (±${bar_range})",
                             template="plotly_dark",
                             height=350,
                             barmode='stack',
-                            yaxis_title="Strike Price",
+                            yaxis=dict(
+                                title="Strike Price",
+                                ticktext=y_labels_oi,
+                                tickvals=oi_by_strike.index
+                            ),
                             xaxis_title="Open Interest",
-                            margin=dict(l=60, r=80, t=60, b=20),
+                            margin=dict(l=80, r=80, t=60, b=20),
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                         )
                         
