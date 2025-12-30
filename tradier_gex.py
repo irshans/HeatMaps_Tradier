@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import requests
 import time
 from datetime import datetime
-import pytz  # Added for timezone handling
+import pytz
 
 # --- APP CONFIG ---
 st.set_page_config(page_title="GEX Pro 2025", page_icon="📊", layout="wide")
@@ -118,8 +118,9 @@ def process_exposure(df, S, s_range):
 # -------------------------
 # Visualizations
 # -------------------------
-def render_heatmap(df, ticker, S):
-    pivot = df.pivot_table(index='strike', columns='expiry', values='gex', aggfunc='sum').sort_index(ascending=False).fillna(0)
+def render_heatmap(df, ticker, S, mode):
+    val_col = mode.lower()
+    pivot = df.pivot_table(index='strike', columns='expiry', values=val_col, aggfunc='sum').sort_index(ascending=False).fillna(0)
     z_raw, x_labs, y_labs = pivot.values, pivot.columns.tolist(), pivot.index.tolist()
     abs_limit = np.max(np.abs(z_raw)) if z_raw.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
@@ -127,7 +128,7 @@ def render_heatmap(df, ticker, S):
     fig = go.Figure(data=go.Heatmap(
         z=z_raw, x=x_labs, y=y_labs,
         colorscale=CUSTOM_COLORSCALE, zmin=-abs_limit, zmax=abs_limit, zmid=0,
-        colorbar=dict(title="GEX ($)", tickfont=dict(family="Arial"))
+        colorbar=dict(title=f"{mode} ($)", tickfont=dict(family="Arial"))
     ))
 
     for i, strike in enumerate(y_labs):
@@ -137,11 +138,11 @@ def render_heatmap(df, ticker, S):
             star = " ★" if abs(val) == abs_limit and abs_limit > 0 else ""
             label = f"${val/1e3:,.0f}K{star}"
             t_color = "black" if val >= 0 else "white"
-            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color=t_color, size=12))
+            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color=t_color, size=11))
 
     calc_height = max(600, len(y_labs) * 25)
     fig.update_layout(
-        title=f"{ticker} GEX Matrix | Spot: ${S:,.2f}", 
+        title=f"{ticker} {mode} | Spot: ${S:,.2f}", 
         template="plotly_dark", height=calc_height, font=dict(family="Arial"),
         xaxis=dict(type='category', side='top'),
         yaxis=dict(
@@ -170,7 +171,7 @@ def render_gamma_bar(df, S):
 
     fig.update_layout(
         title="Total GEX by Strike (Structural Walls)", 
-        template="plotly_dark", height=450, font=dict(family="Arial"),
+        template="plotly_dark", height=400, font=dict(family="Arial"),
         xaxis=dict(title="Strike"), yaxis=dict(title="Net GEX ($)")
     )
     return fig
@@ -180,7 +181,6 @@ def render_gamma_bar(df, S):
 # -------------------------
 @st.fragment(run_every="60s")
 def dashboard_content(ticker, max_exp, s_range):
-    # --- TIMEZONE FIX ---
     tz_est = pytz.timezone('US/Eastern')
     now_est = datetime.now(pytz.utc).astimezone(tz_est)
     
@@ -190,6 +190,7 @@ def dashboard_content(ticker, max_exp, s_range):
     if S and raw_df is not None:
         df = process_exposure(raw_df, S, s_range)
         if not df.empty:
+            # Metrics row
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Net GEX", f"${df['gex'].sum()/1e9:,.2f}B")
             m2.metric("Net VEX", f"${df['vex'].sum()/1e6:,.1f}M")
@@ -198,20 +199,44 @@ def dashboard_content(ticker, max_exp, s_range):
             p_oi = df[df['type']=='put']['oi'].sum()
             m5.metric("C/P Ratio", f"{(df[df['type']=='call']['oi'].sum()/p_oi):.2f}" if p_oi > 0 else "0")
 
-            st.plotly_chart(render_heatmap(df, ticker, S), width="stretch")
+            st.markdown("---")
+            
+            # Side-by-side GEX and VEX heatmaps
+            col_gex, col_vex = st.columns(2)
+            
+            with col_gex:
+                st.markdown("### GEX Exposure")
+                st.plotly_chart(render_heatmap(df, ticker, S, "GEX"), width="stretch")
+            
+            with col_vex:
+                st.markdown("### VEX Exposure")
+                st.plotly_chart(render_heatmap(df, ticker, S, "VEX"), width="stretch")
+            
+            # GEX bar chart below
+            st.markdown("---")
             bar_fig = render_gamma_bar(df, S)
-            if bar_fig: st.plotly_chart(bar_fig, width="stretch")
-        else: st.warning("No data found.")
+            if bar_fig: 
+                st.plotly_chart(bar_fig, width="stretch")
+        else: 
+            st.warning("No data found.")
+    else:
+        st.error("Failed to fetch data. Check ticker symbol.")
 
 def main():
-    st.markdown("<h2 style='text-align:center;'>📊 GEX Pro Analytics</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;'>📊 GEX / VEX Pro Analytics</h2>", unsafe_allow_html=True)
     
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8], vertical_alignment="bottom")
-    ticker = c1.text_input("Ticker", value="SPX").upper().strip()
-    max_exp = c2.number_input("Expiries", 1, 15, 6)
-    s_range = c3.number_input("Strike ±", 5, 500, 80 if ticker == "SPX" else 25)
+    ticker = c1.text_input("Ticker", value="SPY").upper().strip()
     
-    if st.button("Run", type="primary", width="stretch") or "run_once" not in st.session_state:
+    # Set defaults based on ticker
+    is_spx = ticker in ["SPX", "SPXW"]
+    default_exp = 5
+    default_range = 80 if is_spx else 25
+    
+    max_exp = c2.number_input("Expiries", 1, 15, default_exp)
+    s_range = c3.number_input("Strike ±", 5, 500, default_range)
+    
+    if c4.button("Run", type="primary") or "run_once" not in st.session_state:
         st.session_state.run_once = True
     
     dashboard_content(ticker, max_exp, s_range)
