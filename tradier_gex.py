@@ -65,9 +65,6 @@ def fetch_data(ticker, max_exp):
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
     
-    # Determine Contract Size (SPX/NDX = 100 multiplier, but Notional is 10x SPY)
-    multiplier = 100 
-    
     exp_data = tradier_get("markets/options/expirations", {"symbol": ticker, "includeAllRoots": "true"})
     if not exp_data: return S, None
     all_exps = exp_data['expirations']['date']
@@ -100,22 +97,18 @@ def process_institutional_exposure(df, S, s_range):
         
         gamma = float(g.get('gamma') or 0)
         vega  = float(g.get('vega') or 0)
-        # Fallback to smv_vol (ORATS) as it is more stable for Vanna
         iv = float(g.get('smv_vol') or g.get('mid_iv') or 0)
         if iv > 1.0: iv /= 100.0
             
         oi = int(row.get('open_interest') or 0)
         side = 1 if row['option_type'].lower() == 'call' else -1
         
-        # --- INSTITUTIONAL FORMULAS ---
-        # GEX ($ per 1% move): Side * Gamma * S^2 * 0.01 * 100 * OI
+        # Institutional GEX ($ per 1% move)
         gex_val = side * gamma * (S**2) * 0.01 * 100 * oi
         
-        # VANNA ($ change in Delta per 1% IV move): 
-        # Vanna = Vega / (S * IV)
+        # Institutional VANEX
         if S > 0 and iv > 0:
             vanna_raw = vega / (S * iv)
-            # VANEX ($): Side * Vanna * S * 0.01 * 100 * OI
             vanex_val = side * vanna_raw * S * 0.01 * 100 * oi
         else:
             vanex_val = 0
@@ -136,7 +129,6 @@ def render_heatmap(df, ticker, S, mode):
         colorscale=CUSTOM_COLORSCALE, zmin=-abs_max, zmax=abs_max, zmid=0
     ))
 
-    # Dynamic annotation units
     for i, strike in enumerate(pivot.index):
         for j, exp in enumerate(pivot.columns):
             val = z[i, j]
@@ -180,8 +172,9 @@ def main():
             c3.metric("Spot", f"${S:.2f}")
             
             tab1, tab2 = st.tabs(["Gamma Exposure", "Vanna Exposure"])
-            with tab1: st.plotly_chart(render_heatmap(df, ticker, S, "GEX"), use_container_width=True)
-            with tab2: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX"), use_container_width=True)
+            # UPDATED: use_container_width -> width="stretch"
+            with tab1: st.plotly_chart(render_heatmap(df, ticker, S, "GEX"), width="stretch")
+            with tab2: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX"), width="stretch")
         else:
             st.error("Could not fetch data.")
 
