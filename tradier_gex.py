@@ -180,7 +180,7 @@ def render_heatmap(df, ticker, S, mode):
 # -------------------------
 # Main Logic
 # -------------------------
-@st.fragment(run_every="60s")
+@st.fragment(run_every="600s")
 def dashboard_content(ticker, max_exp, s_range):
     tz_est = pytz.timezone('US/Eastern')
     now_est = datetime.now(pytz.utc).astimezone(tz_est)
