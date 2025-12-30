@@ -103,28 +103,27 @@ def process_exposure(df, S, s_range):
         g = row.get('greeks')
         if not g or not isinstance(g, dict): continue
         
-        # 1. Pull Gamma and Vega
         gamma = float(g.get('gamma') or 0)
         vega  = float(g.get('vega') or 0)
-        
-        # 2. Robust IV Extraction (Fallback Chain)
-        iv = float(g.get('smv_vol') or g.get('mid_iv') or g.get('ask_iv') or 0)
-        
-        # Scale to decimal if needed
+        iv    = float(g.get('smv_vol') or g.get('mid_iv') or 0)
         if iv > 1.0: iv /= 100.0
             
-        oi      = int(row.get('open_interest') or 0)
+        oi = int(row.get('open_interest') or 0)
         op_type = row['option_type'].lower()
-        side    = 1 if op_type == 'call' else -1
+        side = 1 if op_type == 'call' else -1
 
-        # 3. Manual Vanna Calculation: Vanna = Vega / (Spot * IV)
+        # Institutional Vanna Calculation
+        # Vanna (dVega/dSpot) * Spot * 1% Vol Shift * 100 (Contract Size) * OI
         if S > 0 and iv > 0 and vega != 0:
-            vanna = vega / (S * iv)
+            # This represents the $ change in Delta for a 1% move in IV
+            vanna_raw = vega / (S * iv)
+            vanex = side * vanna_raw * S * 0.01 * 100 * oi
         else:
-            vanna = 0
+            vanex = 0
             
-        gex = side * gamma * (S**2) * 0.01 * CONTRACT_SIZE * oi
-        vanex = side * vanna * S * 0.01 * CONTRACT_SIZE * oi
+        # GEX Calculation ($ Notional)
+        # Gamma * Spot^2 * 0.01 * 100 * OI
+        gex = side * gamma * (S**2) * 0.01 * 100 * oi
         
         res.append({
             "strike": row['strike'], 
@@ -132,9 +131,7 @@ def process_exposure(df, S, s_range):
             "gex": gex,
             "vanex": vanex,
             "type": op_type, 
-            "oi": oi,
-            "vega_raw": vega,
-            "iv_raw": iv
+            "oi": oi
         })
         
     return pd.DataFrame(res)
