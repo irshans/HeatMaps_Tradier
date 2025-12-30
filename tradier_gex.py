@@ -310,11 +310,21 @@ def main():
                 flip_strike = find_gamma_flip(df)
                 total_dex = df['dex'].sum()
                 
-                m1, m2, m3, m4 = st.columns(4)
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Net GEX", f"${df['gex'].sum():,.0f}")
                 m2.metric("Dealer Delta (DEX)", f"{total_dex/1e6:.1f}M Shrs", delta=f"{'Short' if total_dex < 0 else 'Long'} Hedged")
                 m3.metric("Gamma Flip", f"${flip_strike:,.0f}" if flip_strike else "N/A")
                 m4.metric("Spot Price", f"${S:,.2f}")
+                
+                # Hedging Pressure Gauge
+                net_gex = df['gex'].sum()
+                if net_gex > 0:
+                    pressure_status = "🟢 Stabilizers"
+                    pressure_desc = "Pos Gamma"
+                else:
+                    pressure_status = "🔴 Forced Sellers"
+                    pressure_desc = "Neg Gamma"
+                m5.metric("Hedging Pressure", pressure_status, delta=pressure_desc)
 
                 st.markdown("---")
                 
@@ -326,6 +336,15 @@ def main():
                 df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range) & (df['oi'] > 0)].copy()
                 
                 if not df_bar.empty:
+                    # Find floor and ceiling strikes
+                    df_bar_real = df_bar[df_bar['type'] != 'filled']
+                    
+                    call_oi = df_bar_real[df_bar_real['type'] == 'call'].groupby('strike')['oi'].sum()
+                    put_oi = df_bar_real[df_bar_real['type'] == 'put'].groupby('strike')['oi'].sum()
+                    
+                    ceiling_strike = call_oi.idxmax() if not call_oi.empty else None
+                    floor_strike = put_oi.idxmax() if not put_oi.empty else None
+                    
                     # A) GEX Concentrations by Strike - HORIZONTAL BARS
                     with col_bar1:
                         gex_by_strike = df_bar.groupby('strike')['gex'].sum().sort_index(ascending=True)
@@ -347,9 +366,23 @@ def main():
                         # Add horizontal line for spot price
                         fig_gex.add_hline(y=S, line_dash="dash", line_color="yellow", line_width=2)
                         
-                        # Create custom y-axis labels with arrow for spot
-                        y_labels = [f"➔ <b>${s:.2f}</b>" if abs(s - S) < 0.01 else f"${s:.2f}" 
-                                   for s in gex_by_strike.index]
+                        # Add floor and ceiling lines
+                        if floor_strike:
+                            fig_gex.add_hline(y=floor_strike, line_dash="dot", line_color="#e67e22", line_width=2)
+                        if ceiling_strike:
+                            fig_gex.add_hline(y=ceiling_strike, line_dash="dot", line_color="#3498db", line_width=2)
+                        
+                        # Create custom y-axis labels with arrow for spot, and markers for floor/ceiling
+                        y_labels = []
+                        for s in gex_by_strike.index:
+                            if abs(s - S) < 0.01:
+                                y_labels.append(f"➔ <b>${s:.2f}</b>")
+                            elif ceiling_strike and abs(s - ceiling_strike) < 0.01:
+                                y_labels.append(f"🔵 ${s:.2f} CEIL")
+                            elif floor_strike and abs(s - floor_strike) < 0.01:
+                                y_labels.append(f"🟠 ${s:.2f} FLOOR")
+                            else:
+                                y_labels.append(f"${s:.2f}")
                         
                         fig_gex.update_layout(
                             title=f"GEX Concentration (±${bar_range})",
@@ -362,15 +395,13 @@ def main():
                                 tickvals=gex_by_strike.index
                             ),
                             xaxis_title="Gamma Exposure ($)",
-                            margin=dict(l=80, r=80, t=60, b=20)
+                            margin=dict(l=110, r=80, t=60, b=20)
                         )
                         
                         st.plotly_chart(fig_gex, use_container_width=True)
                     
                     # B) Options Inventory (OI) by Strike - HORIZONTAL BARS
                     with col_bar2:
-                        # Filter out 'filled' type entries for OI chart
-                        df_bar_real = df_bar[df_bar['type'] != 'filled']
                         oi_by_strike = df_bar_real.groupby(['strike', 'type'])['oi'].sum().unstack(fill_value=0)
                         
                         fig_oi = go.Figure()
@@ -404,9 +435,23 @@ def main():
                         # Add horizontal line for spot price
                         fig_oi.add_hline(y=S, line_dash="dash", line_color="yellow", line_width=2)
                         
-                        # Create custom y-axis labels with arrow for spot
-                        y_labels_oi = [f"➔ <b>${s:.2f}</b>" if abs(s - S) < 0.01 else f"${s:.2f}" 
-                                      for s in oi_by_strike.index]
+                        # Add floor and ceiling lines
+                        if floor_strike:
+                            fig_oi.add_hline(y=floor_strike, line_dash="dot", line_color="#e67e22", line_width=2)
+                        if ceiling_strike:
+                            fig_oi.add_hline(y=ceiling_strike, line_dash="dot", line_color="#3498db", line_width=2)
+                        
+                        # Create custom y-axis labels with arrow for spot, and markers for floor/ceiling
+                        y_labels_oi = []
+                        for s in oi_by_strike.index:
+                            if abs(s - S) < 0.01:
+                                y_labels_oi.append(f"➔ <b>${s:.2f}</b>")
+                            elif ceiling_strike and abs(s - ceiling_strike) < 0.01:
+                                y_labels_oi.append(f"🔵 ${s:.2f} CEIL")
+                            elif floor_strike and abs(s - floor_strike) < 0.01:
+                                y_labels_oi.append(f"🟠 ${s:.2f} FLOOR")
+                            else:
+                                y_labels_oi.append(f"${s:.2f}")
                         
                         fig_oi.update_layout(
                             title=f"Options Inventory (±${bar_range})",
@@ -419,7 +464,7 @@ def main():
                                 tickvals=oi_by_strike.index
                             ),
                             xaxis_title="Open Interest",
-                            margin=dict(l=80, r=80, t=60, b=20),
+                            margin=dict(l=110, r=80, t=60, b=20),
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                         )
                         
@@ -451,10 +496,30 @@ def main():
                     'Call Gamma': df_calls.groupby('strike')['gamma'].sum(),
                     'Put Gamma': df_puts.groupby('strike')['gamma'].sum(),
                     'Net Gamma': df_real.groupby('strike')['gamma'].sum(),
-                    'Dealer Delta': df_real.groupby('strike')['dex'].sum()
+                    'Dealer Delta': df_real.groupby('strike')['dex'].sum(),
+                    'Call OI': df_calls.groupby('strike')['oi'].sum(),
+                    'Put OI': df_puts.groupby('strike')['oi'].sum()
                 }).fillna(0)
                 
                 strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
+                
+                # Find floor and ceiling from full data
+                if not df_calls.empty:
+                    ceiling_strike_full = df_calls.groupby('strike')['oi'].sum().idxmax()
+                else:
+                    ceiling_strike_full = None
+                    
+                if not df_puts.empty:
+                    floor_strike_full = df_puts.groupby('strike')['oi'].sum().idxmax()
+                else:
+                    floor_strike_full = None
+                
+                # Add labels column for floor/ceiling
+                strike_diag['Label'] = ''
+                if ceiling_strike_full and ceiling_strike_full in strike_diag.index:
+                    strike_diag.loc[ceiling_strike_full, 'Label'] = '🔵 CEILING'
+                if floor_strike_full and floor_strike_full in strike_diag.index:
+                    strike_diag.loc[floor_strike_full, 'Label'] = '🟠 FLOOR'
                 
                 # Using np.abs to avoid Index object error
                 dist_idx = np.abs(strike_diag.index - S).argsort()[:5]
@@ -469,7 +534,8 @@ def main():
                         'Call GEX': '${:,.0f}', 'Put GEX': '${:,.0f}', 'Net GEX': '${:,.0f}',
                         'Call Vanna': '${:,.0f}', 'Put Vanna': '${:,.0f}', 'Net Vanna': '${:,.0f}',
                         'Call Gamma': '{:,.2f}', 'Put Gamma': '{:,.2f}', 'Net Gamma': '{:,.2f}',
-                        'Dealer Delta': '{:,.0f}', 'Dist %': '{:.2f}%'
+                        'Dealer Delta': '{:,.0f}', 'Dist %': '{:.2f}%',
+                        'Call OI': '{:,.0f}', 'Put OI': '{:,.0f}'
                     }).map(color_greeks, subset=['Net GEX', 'Net Vanna', 'Net Gamma', 'Dealer Delta']),
                     use_container_width=True
                 )
