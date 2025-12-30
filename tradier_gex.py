@@ -139,6 +139,78 @@ def process_exposure(df, S, s_range):
     
     return pd.DataFrame(res)
 
+def smart_fill_strikes(df, S):
+    """Auto-detect strike interval and fill missing strikes for uniform heatmap"""
+    if df.empty:
+        return df
+    
+    # Detect actual interval in data
+    strikes = sorted(df['strike'].unique())
+    if len(strikes) > 1:
+        # Calculate most common interval
+        diffs = np.diff(strikes)
+        common_interval = np.median(diffs)
+    else:
+        common_interval = 5
+    
+    # Round to nearest standard interval
+    if common_interval <= 1:
+        interval = 1
+    elif common_interval <= 2.5:
+        interval = 2.5
+    else:
+        interval = 5
+    
+    st.info(f"📊 Detected strike interval: ${interval} | Filling gaps for uniform display")
+    
+    # Create complete strike range
+    min_strike = df['strike'].min()
+    max_strike = df['strike'].max()
+    
+    # Adjust min/max to align with interval
+    min_strike = np.floor(min_strike / interval) * interval
+    max_strike = np.ceil(max_strike / interval) * interval
+    
+    all_strikes = np.arange(min_strike, max_strike + interval, interval)
+    all_expiries = sorted(df['expiry'].unique())
+    
+    # Create full grid
+    full_index = pd.MultiIndex.from_product([all_strikes, all_expiries], 
+                                            names=['strike', 'expiry'])
+    
+    # Aggregate existing data by strike and expiry
+    df_agg = df.groupby(['strike', 'expiry']).agg({
+        'gex': 'sum',
+        'vanex': 'sum',
+        'dex': 'sum',
+        'gamma': 'sum',
+        'oi': 'sum'
+    }).reindex(full_index, fill_value=0).reset_index()
+    
+    # Add back type information (for bar charts) - mark filled strikes as 'filled'
+    df_with_type = df.groupby(['strike', 'expiry', 'type']).agg({
+        'gex': 'sum',
+        'vanex': 'sum',
+        'dex': 'sum',
+        'gamma': 'sum',
+        'oi': 'sum'
+    }).reset_index()
+    
+    # Merge to preserve type information where available
+    df_final = df_agg.merge(
+        df_with_type[['strike', 'expiry', 'type', 'oi']],
+        on=['strike', 'expiry'],
+        how='left',
+        suffixes=('', '_typed')
+    )
+    
+    # For strikes with data, keep original type; for filled strikes, mark as both
+    df_final['type'] = df_final['type'].fillna('filled')
+    df_final['oi'] = df_final['oi_typed'].fillna(df_final['oi'])
+    df_final = df_final.drop(columns=['oi_typed'], errors='ignore')
+    
+    return df_final
+
 def find_gamma_flip(df):
     if df.empty: return None
     strike_sums = df.groupby('strike')['gex'].sum().sort_index()
@@ -155,19 +227,35 @@ def render_heatmap(df, ticker, S, mode, flip_strike):
     abs_limit = np.max(np.abs(z)) if z.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
 
-    fig = go.Figure(data=go.Heatmap(z=z, x=x_labs, y=y_labs, colorscale=CUSTOM_COLORSCALE, zmin=-abs_limit, zmax=abs_limit, zmid=0))
+    fig = go.Figure(data=go.Heatmap(
+        z=z, 
+        x=x_labs, 
+        y=y_labs, 
+        colorscale=CUSTOM_COLORSCALE, 
+        zmin=-abs_limit, 
+        zmax=abs_limit, 
+        zmid=0,
+        ygap=0,  # Remove gaps between cells for uniform appearance
+        xgap=1
+    ))
 
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z[i, j]
             label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
-            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color="white" if val < 0 else "black", size=9, family="Arial Black"))
+            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, 
+                             font=dict(color="white" if val < 0 else "black", size=9, family="Arial Black"))
 
     y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
 
-    fig.update_layout(title=f"{ticker} {mode} Matrix", template="plotly_dark", height=650, 
-                      margin=dict(l=80, r=20, t=80, b=20),
-                      xaxis=dict(side='top', type='category'), yaxis=dict(ticktext=y_text, tickvals=y_labs))
+    fig.update_layout(
+        title=f"{ticker} {mode} Matrix", 
+        template="plotly_dark", 
+        height=650, 
+        margin=dict(l=80, r=20, t=80, b=20),
+        xaxis=dict(side='top', type='category'),
+        yaxis=dict(ticktext=y_text, tickvals=y_labs)
+    )
     return fig
 
 # -------------------------
@@ -190,6 +278,9 @@ def main():
         if S and raw_df is not None:
             df = process_exposure(raw_df, S, s_range)
             if not df.empty:
+                # Apply smart strike filling for uniform heatmap
+                df = smart_fill_strikes(df, S)
+                
                 flip_strike = find_gamma_flip(df)
                 total_dex = df['dex'].sum()
                 
@@ -204,9 +295,9 @@ def main():
                 # --- BAR CHARTS ---
                 col_bar1, col_bar2 = st.columns(2)
                 
-                # Get strikes within ±10 of spot for bar charts
+                # Get strikes within ±10 of spot for bar charts (use original non-zero data only)
                 bar_range = 10
-                df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range)].copy()
+                df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range) & (df['oi'] > 0)].copy()
                 
                 if not df_bar.empty:
                     # A) GEX Concentrations by Strike
@@ -243,7 +334,9 @@ def main():
                     
                     # B) Options Inventory (OI) by Strike
                     with col_bar2:
-                        oi_by_strike = df_bar.groupby(['strike', 'type'])['oi'].sum().unstack(fill_value=0)
+                        # Filter out 'filled' type entries for OI chart
+                        df_bar_real = df_bar[df_bar['type'] != 'filled']
+                        oi_by_strike = df_bar_real.groupby(['strike', 'type'])['oi'].sum().unstack(fill_value=0)
                         
                         fig_oi = go.Figure()
                         
@@ -296,21 +389,24 @@ def main():
                 # --- DIAGNOSTIC TABLE ---
                 st.markdown("### 🔍 Strike Diagnostics (5 Closest to Spot)")
                 
+                # Filter out filled strikes (zero OI) for diagnostics
+                df_real = df[df['oi'] > 0].copy()
+                
                 # Create separate dataframes for calls and puts
-                df_calls = df[df['type'] == 'call']
-                df_puts = df[df['type'] == 'put']
+                df_calls = df_real[df_real['type'] == 'call']
+                df_puts = df_real[df_real['type'] == 'put']
 
                 strike_diag = pd.DataFrame({
                     'Call GEX': df_calls.groupby('strike')['gex'].sum(),
                     'Put GEX': df_puts.groupby('strike')['gex'].sum(),
-                    'Net GEX': df.groupby('strike')['gex'].sum(),
+                    'Net GEX': df_real.groupby('strike')['gex'].sum(),
                     'Call Vanna': df_calls.groupby('strike')['vanex'].sum(),
                     'Put Vanna': df_puts.groupby('strike')['vanex'].sum(),
-                    'Net Vanna': df.groupby('strike')['vanex'].sum(),
+                    'Net Vanna': df_real.groupby('strike')['vanex'].sum(),
                     'Call Gamma': df_calls.groupby('strike')['gamma'].sum(),
                     'Put Gamma': df_puts.groupby('strike')['gamma'].sum(),
-                    'Net Gamma': df.groupby('strike')['gamma'].sum(),
-                    'Dealer Delta': df.groupby('strike')['dex'].sum()
+                    'Net Gamma': df_real.groupby('strike')['gamma'].sum(),
+                    'Dealer Delta': df_real.groupby('strike')['dex'].sum()
                 }).fillna(0)
                 
                 strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
