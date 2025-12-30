@@ -160,18 +160,19 @@ def render_heatmap(df, ticker, S, mode):
         colorbar=dict(title=f"{mode} ($)", tickfont=dict(family="Arial"))
     ))
 
-    # Calculate font size based on row count
+    # Calculate dynamic font size based on strike count
     font_size = max(7, min(10, int(150 / max(1, len(y_labs)))))
 
-    # Add Annotations (Forced Thousands)
+    # Add Annotations
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
             if val == 0: continue
             
+            # Format in Thousands as requested
             label = f"${val/1e3:,.1f}K"
             
-            # Contrast Logic
+            # Smart Contrast logic
             norm = (val + abs_limit) / (2 * abs_limit)
             t_color = "black" if 0.4 < norm < 0.9 else "white"
 
@@ -183,7 +184,7 @@ def render_heatmap(df, ticker, S, mode):
 
     calc_height = max(600, len(y_labs) * 25)
 
-    # UPDATED: Removed cliponaxis property that caused the error
+    # FINAL FIX: cliponaxis removed from both add_annotation and update_layout
     fig.update_layout(
         title=f"{ticker} {mode} Matrix | Spot: ${S:,.2f}",
         template="plotly_dark",
