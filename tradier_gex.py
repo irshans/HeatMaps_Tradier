@@ -27,7 +27,6 @@ else:
     st.stop()
 
 BASE_URL = "https://api.tradier.com/v1/"
-CONTRACT_SIZE = 100
 
 CUSTOM_COLORSCALE = [
     [0.00, '#050018'], [0.10, '#260446'], [0.25, '#56117a'],
@@ -51,7 +50,6 @@ def tradier_get(endpoint, params):
 def get_market_days():
     open_days = set()
     dt = datetime.now()
-    # Pull current and next month calendars to ensure we have enough days
     for month_offset in [0, 1]:
         target_dt = dt if month_offset == 0 else (dt.replace(day=1) + pd.DateOffset(months=1))
         cal = tradier_get("markets/calendar", {"month": target_dt.month, "year": target_dt.year})
@@ -75,7 +73,6 @@ def fetch_data(ticker, max_exp):
     all_exps = exp_data['expirations']['date']
     if not isinstance(all_exps, list): all_exps = [all_exps]
     
-    # Filter only for days markets are actually open
     valid_exps = sorted([exp for exp in all_exps if exp in open_days])[:max_exp]
     
     dfs = []
@@ -98,19 +95,27 @@ def process_exposure(df, S, s_range):
     for _, row in df.iterrows():
         g = row.get('greeks')
         if not g: continue
-        gamma, vega = float(g.get('gamma') or 0), float(g.get('vega') or 0)
+        gamma, vega = float(g.get('gamma', 0) or 0), float(g.get('vega', 0) or 0)
         iv = float(g.get('smv_vol') or g.get('mid_iv') or 0)
         if iv > 1.0: iv /= 100.0
-        oi, side = int(row.get('open_interest') or 0), (1 if row['option_type'].lower() == 'call' else -1)
+        oi, side = int(row.get('open_interest', 0) or 0), (1 if row['option_type'].lower() == 'call' else -1)
 
-        # Institutional Formulas
         gex = side * gamma * (S**2) * 0.01 * 100 * oi
         vanex = (side * (vega / (S * iv)) * S * 0.01 * 100 * oi) if (S > 0 and iv > 0) else 0
         res.append({"strike": row['strike'], "expiry": row['expiration_date'], "gex": gex, "vanex": vanex, "type": row['option_type'].lower(), "oi": oi})
     return pd.DataFrame(res)
 
-def render_heatmap(df, ticker, S, mode):
-    # Ensure chronological column sorting
+def find_gamma_flip(df):
+    if df.empty: return None
+    strike_sums = df.groupby('strike')['gex'].sum().sort_index()
+    # Find where the sign changes from negative to positive
+    for i in range(len(strike_sums) - 1):
+        if (strike_sums.iloc[i] < 0 and strike_sums.iloc[i+1] > 0) or (strike_sums.iloc[i] > 0 and strike_sums.iloc[i+1] < 0):
+            # Return the strike closest to zero GEX
+            return strike_sums.index[i] if abs(strike_sums.iloc[i]) < abs(strike_sums.iloc[i+1]) else strike_sums.index[i+1]
+    return None
+
+def render_heatmap(df, ticker, S, mode, flip_strike):
     pivot = df.pivot_table(index='strike', columns='expiry', values=mode.lower(), aggfunc='sum')
     pivot = pivot.reindex(sorted(pivot.columns), axis=1).sort_index(ascending=False).fillna(0)
     
@@ -123,14 +128,22 @@ def render_heatmap(df, ticker, S, mode):
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z[i, j]
-            label = f"${val/1e6:.1f}M" if abs(val) >= 1e6 else (f"${val/1e3:.0f}K" if abs(val) >= 1e3 else f"${val:.0f}")
+            label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
             fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, font=dict(color="white" if val < 0 else "black", size=10, family="Arial Black"))
+
+    # Custom Y-Axis Labels to show Spot and Flip
+    y_text = []
+    for s in y_labs:
+        label = str(s)
+        if s == closest_strike: label = f"➔ <b>{s}</b>"
+        if s == flip_strike: label = f"⚠️ <b>{s} FLIP</b>"
+        y_text.append(label)
 
     fig.update_layout(
         title=f"{ticker} {mode} Matrix", 
         template="plotly_dark", height=700, 
         xaxis=dict(side='top', type='category', categoryorder='array', categoryarray=x_labs), 
-        yaxis=dict(ticktext=[f"➔ <b>{s}</b>" if s == closest_strike else str(s) for s in y_labs], tickvals=y_labs)
+        yaxis=dict(ticktext=y_text, tickvals=y_labs)
     )
     return fig
 
@@ -140,7 +153,6 @@ def render_heatmap(df, ticker, S, mode):
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX / VANEX Pro Analytics</h2>", unsafe_allow_html=True)
     
-    # Header Controls
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1], vertical_alignment="bottom")
     ticker = c1.text_input("Ticker", value="SPY").upper().strip()
     max_exp = c2.number_input("Expiries", 1, 15, 5)
@@ -159,20 +171,22 @@ def main():
         if S and raw_df is not None:
             df = process_exposure(raw_df, S, s_range)
             if not df.empty:
+                flip_strike = find_gamma_flip(df)
+                
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Net GEX", f"${df['gex'].sum()/1e6:.1f}M")
-                m2.metric("Net VANEX", f"${df['vanex'].sum()/1e6:.1f}M")
-                m3.metric("Calls OI", f"{df[df['type']=='call']['oi'].sum():,.0f}")
-                m4.metric("Puts OI", f"{df[df['type']=='put']['oi'].sum():,.0f}")
+                m1.metric("Net GEX", f"${df['gex'].sum():,.0f}")
+                m2.metric("Net VANEX", f"${df['vanex'].sum():,.0f}")
+                m3.metric("Gamma Flip", f"${flip_strike:,.0f}" if flip_strike else "N/A")
+                m4.metric("Spot Price", f"${S:,.2f}")
 
                 st.markdown("---")
                 col_gex, col_van = st.columns(2)
                 with col_gex:
                     st.markdown("### 🟢 GEX Exposure (Gamma)")
-                    st.plotly_chart(render_heatmap(df, ticker, S, "GEX"), width="stretch")
+                    st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), width="stretch")
                 with col_van:
                     st.markdown("### 🟠 VANEX Exposure (Vanna)")
-                    st.plotly_chart(render_heatmap(df, ticker, S, "VANEX"), width="stretch")
+                    st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), width="stretch")
             else: st.warning("No data in range.")
         else: st.error("API Error.")
 
