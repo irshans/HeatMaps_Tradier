@@ -102,12 +102,10 @@ def process_exposure(df, S, s_range):
         if iv > 1.0: iv /= 100.0
         oi, side = int(row.get('open_interest', 0) or 0), (1 if row['option_type'].lower() == 'call' else -1)
 
-        # Dealer Exposure Calculations (assuming dealer is SHORT the option)
-        # Note: Dealer Delta = - (Option Delta) * OI * 100
         gex = side * gamma * (S**2) * 0.01 * 100 * oi
         vanna_raw = vega / (S * iv) if (S > 0 and iv > 0) else 0
         vanex = side * vanna_raw * S * 0.01 * 100 * oi
-        dex = -delta * 100 * oi  # Dealer Delta Exposure
+        dex = -delta * 100 * oi  # Dealer Delta (Assuming dealer is short the option)
         
         res.append({
             "strike": row['strike'], 
@@ -153,7 +151,7 @@ def render_heatmap(df, ticker, S, mode, flip_strike):
     return fig
 
 # -------------------------
-# Dashboard
+# Main Page
 # -------------------------
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX / VANEX Pro Analytics</h2>", unsafe_allow_html=True)
@@ -177,16 +175,17 @@ def main():
                 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Net GEX", f"${df['gex'].sum():,.0f}")
-                m2.metric("Net Dealer Delta (DEX)", f"{total_dex/1e6:.1f}M Shrs", delta=f"{'Short' if total_dex < 0 else 'Long'} Hedged")
+                m2.metric("Dealer Delta (DEX)", f"{total_dex/1e6:.1f}M Shrs", delta=f"{'Short' if total_dex < 0 else 'Long'} Hedged")
                 m3.metric("Gamma Flip", f"${flip_strike:,.0f}" if flip_strike else "N/A")
                 m4.metric("Spot Price", f"${S:,.2f}")
 
                 st.markdown("---")
                 col_gex, col_van = st.columns(2)
-                with col_gex: st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
-                with col_van: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), use_container_width=True)
+                with col_gex: st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), width="stretch")
+                with col_van: st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike), width="stretch")
 
-                st.markdown("### 🔍 Strike Diagnostics & Hedging Profile")
+                # --- DIAGNOSTIC TABLE ---
+                st.markdown("### 🔍 Strike Diagnostics (5 Closest to Spot)")
                 
                 strike_diag = df.groupby('strike').agg({
                     'gex': [('Call GEX', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
@@ -204,9 +203,9 @@ def main():
                 strike_diag.columns = [c[1] for c in strike_diag.columns]
                 strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
                 
-                # Closest to spot fix
-                dist_from_spot = (strike_diag.index - S).to_series().abs()
-                closest_strikes = strike_diag.iloc[dist_from_spot.argsort()[:5]].sort_index(ascending=False)
+                # FIXED: Using np.abs to avoid Index object error
+                dist_idx = np.abs(strike_diag.index - S).argsort()[:5]
+                closest_strikes = strike_diag.iloc[dist_idx].sort_index(ascending=False)
 
                 def color_greeks(val):
                     color = '#2ecc71' if val > 0 else '#e74c3c'
