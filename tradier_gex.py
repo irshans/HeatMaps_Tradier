@@ -122,44 +122,77 @@ def process_exposure(df, S, s_range):
 # -------------------------
 def render_heatmap(df, ticker, S, mode):
     val_col = mode.lower()
-    pivot = df.pivot_table(index='strike', columns='expiry', values=val_col, aggfunc='sum').sort_index(ascending=False).fillna(0)
-    z_raw, x_labs, y_labs = pivot.values, pivot.columns.tolist(), pivot.index.tolist()
-    
+    pivot = df.pivot_table(
+        index='strike', 
+        columns='expiry', 
+        values=val_col, 
+        aggfunc='sum'
+    ).sort_index(ascending=False).fillna(0)
+
+    z_raw = pivot.values
+    x_labs = pivot.columns.tolist()
+    y_labs = pivot.index.tolist()
+
     abs_limit = np.max(np.abs(z_raw)) if z_raw.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
 
+    # --- HEATMAP WITH HARD MIDPOINT ---
     fig = go.Figure(data=go.Heatmap(
-        z=z_raw, x=x_labs, y=y_labs,
-        colorscale=CUSTOM_COLORSCALE, zmin=-abs_limit, zmax=abs_limit, zmid=0,
+        z=z_raw,
+        x=x_labs,
+        y=y_labs,
+        colorscale=CUSTOM_COLORSCALE,
+        zmin=-abs_limit,
+        zmax=abs_limit,
+        zmid=0,
+        zauto=False,
         colorbar=dict(title=f"{mode} ($)", tickfont=dict(family="Arial"))
     ))
 
+    # --- TEXT COLOR BASED ON BACKGROUND BRIGHTNESS ---
+    def get_text_color(val):
+        norm = (val + abs_limit) / (2 * abs_limit)
+        return "black" if norm > 0.55 else "white"
+
+    # --- AUTO-SCALE FONT SIZE ---
+    font_size = max(6, int(140 / max(1, len(y_labs))))
+
+    # --- ADD ANNOTATIONS FOR EVERY CELL ---
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
-            # Removed the threshold so ALL values show. 
-            # We skip exactly 0 to keep the chart readable.
-            if val == 0: continue
-            
-            # Forced "Thousands" ($K) formatting as requested
-            label = f"${val/1e3:,.0f}K"
-            
-            t_color = "black" if val >= 0 else "white"
+            label = f"${val/1e3:,.1f}K"
+            t_color = get_text_color(val)
+
             fig.add_annotation(
-                x=exp, y=strike, text=label, showarrow=False, 
-                font=dict(color=t_color, size=9) # Slightly smaller font to fit more labels
+                x=exp,
+                y=strike,
+                text=label,
+                showarrow=False,
+                font=dict(color=t_color, size=font_size)
             )
 
+    fig.update_layout(cliponaxis=False)
+
     calc_height = max(600, len(y_labs) * 25)
+
     fig.update_layout(
-        title=f"{ticker} {mode} Matrix | Spot: ${S:,.2f}", 
-        template="plotly_dark", height=calc_height, font=dict(family="Arial"),
+        title=f"{ticker} {mode} Matrix | Spot: ${S:,.2f}",
+        template="plotly_dark",
+        height=calc_height,
+        font=dict(family="Arial"),
         xaxis=dict(type='category', side='top'),
         yaxis=dict(
-            title="Strike", tickmode='array', tickvals=y_labs,
-            ticktext=[f"➔ <b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}" for s in y_labs]
+            title="Strike",
+            tickmode='array',
+            tickvals=y_labs,
+            ticktext=[
+                f"➔ <b>{s:,.0f}</b>" if s == closest_strike else f"{s:,.0f}"
+                for s in y_labs
+            ]
         )
     )
+
     return fig
 
 def render_gamma_bar(df, S):
