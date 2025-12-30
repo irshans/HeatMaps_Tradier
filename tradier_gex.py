@@ -113,7 +113,7 @@ def process_exposure(df, S, s_range):
             continue
 
         gamma = float(g.get('gamma', 0) or 0)
-        vega = float(g.get('vega', 0) or 0)
+        vega = float(g.get('vanna', 0) or 0)
         oi = int(row.get('open_interest', 0) or 0)
         op_type = row['option_type'].lower()
         side = 1 if op_type == 'call' else -1
