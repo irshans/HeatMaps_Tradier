@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import requests
-import time
 from datetime import datetime
 import pytz
 
@@ -63,7 +62,8 @@ def get_market_days():
                 for d in days:
                     if d.get('status') == 'open':
                         open_days.add(d.get('date'))
-            except: pass
+            except:
+                pass
     return open_days
 
 def fetch_data(ticker, max_exp):
@@ -71,6 +71,7 @@ def fetch_data(ticker, max_exp):
     quote_data = tradier_get("markets/quotes", {"symbols": ticker})
     if not quote_data or 'quotes' not in quote_data:
         return None, None
+
     quote = quote_data['quotes']['quote']
     S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
 
@@ -82,7 +83,8 @@ def fetch_data(ticker, max_exp):
     if not isinstance(all_exps, list): all_exps = [all_exps]
     valid_exps = [exp for exp in all_exps if exp in open_days][:max_exp]
 
-    if not valid_exps: return S, None
+    if not valid_exps:
+        return S, None
 
     dfs = []
     prog = st.progress(0, text="Fetching chains...")
@@ -94,38 +96,48 @@ def fetch_data(ticker, max_exp):
             dfs.append(df_chain)
         prog.progress((i + 1) / len(valid_exps))
     prog.empty()
+
     return S, pd.concat(dfs, ignore_index=True) if dfs else None
 
 def process_exposure(df, S, s_range):
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
     df["strike"] = pd.to_numeric(df["strike"], errors='coerce')
     df = df[(df["strike"] >= S - s_range) & (df["strike"] <= S + s_range)].copy()
+
     res = []
     for _, row in df.iterrows():
         g = row.get('greeks')
-        if not g or not isinstance(g, dict): continue
+        if not g or not isinstance(g, dict):
+            continue
+
         gamma = float(g.get('gamma', 0) or 0)
         vega = float(g.get('vega', 0) or 0)
         oi = int(row.get('open_interest', 0) or 0)
         op_type = row['option_type'].lower()
         side = 1 if op_type == 'call' else -1
+
         res.append({
-            "strike": row['strike'], "expiry": row['expiration_date'],
+            "strike": row['strike'],
+            "expiry": row['expiration_date'],
             "gex": side * gamma * (S**2) * 0.01 * CONTRACT_SIZE * oi,
             "vex": side * vega * 0.01 * CONTRACT_SIZE * oi,
-            "type": op_type, "oi": oi
+            "type": op_type,
+            "oi": oi
         })
+
     return pd.DataFrame(res)
 
 # -------------------------
-# Visualizations
+# Heatmap Visualization
 # -------------------------
 def render_heatmap(df, ticker, S, mode):
     val_col = mode.lower()
     pivot = df.pivot_table(
-        index='strike', 
-        columns='expiry', 
-        values=val_col, 
+        index='strike',
+        columns='expiry',
+        values=val_col,
         aggfunc='sum'
     ).sort_index(ascending=False).fillna(0)
 
@@ -136,7 +148,6 @@ def render_heatmap(df, ticker, S, mode):
     abs_limit = np.max(np.abs(z_raw)) if z_raw.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
 
-    # --- HEATMAP WITH HARD MIDPOINT ---
     fig = go.Figure(data=go.Heatmap(
         z=z_raw,
         x=x_labs,
@@ -149,20 +160,20 @@ def render_heatmap(df, ticker, S, mode):
         colorbar=dict(title=f"{mode} ($)", tickfont=dict(family="Arial"))
     ))
 
-    # --- TEXT COLOR BASED ON BACKGROUND BRIGHTNESS ---
-    def get_text_color(val):
-        norm = (val + abs_limit) / (2 * abs_limit)
-        return "black" if norm > 0.55 else "white"
-
     # --- AUTO-SCALE FONT SIZE ---
-    font_size = max(6, int(140 / max(1, len(y_labs))))
+    font_size = max(7, min(10, int(150 / max(1, len(y_labs)))))
 
-    # --- ADD ANNOTATIONS FOR EVERY CELL ---
+    # --- ADD ANNOTATIONS ---
     for i, strike in enumerate(y_labs):
         for j, exp in enumerate(x_labs):
             val = z_raw[i, j]
+            if val == 0: continue
+            
             label = f"${val/1e3:,.1f}K"
-            t_color = get_text_color(val)
+            
+            # Simple contrast logic: light text for dark ends, dark text for yellow/middle
+            norm = (val + abs_limit) / (2 * abs_limit)
+            t_color = "black" if 0.4 < norm < 0.9 else "white"
 
             fig.add_annotation(
                 x=exp,
@@ -172,14 +183,13 @@ def render_heatmap(df, ticker, S, mode):
                 font=dict(color=t_color, size=font_size)
             )
 
-    fig.update_layout(cliponaxis=False)
-
     calc_height = max(600, len(y_labs) * 25)
 
     fig.update_layout(
         title=f"{ticker} {mode} Matrix | Spot: ${S:,.2f}",
         template="plotly_dark",
         height=calc_height,
+        margin=dict(t=50, b=50, l=50, r=50),
         font=dict(family="Arial"),
         xaxis=dict(type='category', side='top'),
         yaxis=dict(
@@ -195,10 +205,16 @@ def render_heatmap(df, ticker, S, mode):
 
     return fig
 
+# -------------------------
+# Gamma Bar
+# -------------------------
 def render_gamma_bar(df, S):
-    if df.empty: return None
+    if df.empty:
+        return None
+
     agg = df.groupby('strike')['gex'].sum().sort_index()
     strikes, gex_vals = agg.index.tolist(), agg.values
+
     flip_strike = None
     for i in range(len(gex_vals) - 1):
         if np.sign(gex_vals[i]) != np.sign(gex_vals[i + 1]) and gex_vals[i] != 0:
@@ -206,17 +222,23 @@ def render_gamma_bar(df, S):
             break
 
     fig = go.Figure(go.Bar(
-        x=strikes, y=gex_vals,
+        x=strikes,
+        y=gex_vals,
         marker_color=['#F1F50C' if v > 0 else '#56117a' for v in gex_vals]
     ))
+
     if flip_strike:
         fig.add_vline(x=flip_strike, line_dash="dash", line_color="white", annotation_text="Gamma Flip")
 
     fig.update_layout(
-        title="Total GEX by Strike (Structural Walls)", 
-        template="plotly_dark", height=450, font=dict(family="Arial"),
-        xaxis=dict(title="Strike"), yaxis=dict(title="Net GEX ($)")
+        title="Total GEX by Strike (Structural Walls)",
+        template="plotly_dark",
+        height=450,
+        font=dict(family="Arial"),
+        xaxis=dict(title="Strike"),
+        yaxis=dict(title="Net GEX ($)")
     )
+
     return fig
 
 # -------------------------
@@ -226,14 +248,15 @@ def render_gamma_bar(df, S):
 def dashboard_content(ticker, max_exp, s_range):
     tz_est = pytz.timezone('US/Eastern')
     now_est = datetime.now(pytz.utc).astimezone(tz_est)
-    
+
     st.write(f"🕒 Last updated: **{now_est.strftime('%H:%M:%S')} EST** (Auto-refresh: 60s)")
-    
+
     with st.spinner("Analyzing market data..."):
         S, raw_df = fetch_data(ticker, int(max_exp))
-        
+
     if S and raw_df is not None:
         df = process_exposure(raw_df, S, s_range)
+
         if not df.empty:
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Net GEX", f"${df['gex'].sum()/1e9:,.2f}B")
@@ -244,7 +267,7 @@ def dashboard_content(ticker, max_exp, s_range):
             m5.metric("C/P Ratio", f"{(df[df['type']=='call']['oi'].sum()/p_oi):.2f}" if p_oi > 0 else "0")
 
             st.markdown("---")
-            
+
             col_gex, col_vex = st.columns(2)
             with col_gex:
                 st.markdown("### 🟢 GEX Exposure (Gamma)")
@@ -252,30 +275,31 @@ def dashboard_content(ticker, max_exp, s_range):
             with col_vex:
                 st.markdown("### 🟣 VEX Exposure (Vega)")
                 st.plotly_chart(render_heatmap(df, ticker, S, "VEX"), use_container_width=True)
-            
+
             st.markdown("---")
-            
+
             bar_fig = render_gamma_bar(df, S)
-            if bar_fig: 
+            if bar_fig:
                 st.plotly_chart(bar_fig, use_container_width=True)
-        else: 
+
+        else:
             st.warning("No data found in this strike range.")
     else:
         st.error("Failed to fetch data. Check ticker symbol or API connection.")
 
 def main():
     st.markdown("<h2 style='text-align:center;'>📊 GEX / VEX Pro Analytics</h2>", unsafe_allow_html=True)
-    
+
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 0.8], vertical_alignment="bottom")
     ticker = c1.text_input("Ticker", value="SPY").upper().strip()
-    
+
     is_spx = ticker in ["SPX", "SPXW"]
     max_exp = c2.number_input("Expiries", 1, 15, 5)
     s_range = c3.number_input("Strike ±", 5, 500, 80 if is_spx else 25)
-    
+
     if c4.button("Run Now", type="primary", use_container_width=True) or "run_once" not in st.session_state:
         st.session_state.run_once = True
-    
+
     dashboard_content(ticker, max_exp, s_range)
 
 if __name__ == "__main__":
