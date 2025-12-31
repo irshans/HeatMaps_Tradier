@@ -232,10 +232,10 @@ def find_gamma_flip(df):
             return strike_sums.index[i] if abs(strike_sums.iloc[i]) < abs(strike_sums.iloc[i+1]) else strike_sums.index[i+1]
     return None
 
-def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='raw'):
+def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='dealer'):
     # Determine which vanex field to use
     vanex_field = 'vanex' if vanex_type == 'raw' else 'vanex_dealer'
-    value_field = vanex_field if mode.upper() == "VANEX" else mode.lower()
+    value_field = vanex_field if mode.upper() == "VEX" else mode.lower()
     
     pivot = df.pivot_table(index='strike', columns='expiry', values=value_field, aggfunc='sum')
     pivot = pivot.reindex(sorted(pivot.columns), axis=1).sort_index(ascending=False).fillna(0)
@@ -280,13 +280,14 @@ def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='raw'):
 
     y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
 
-    # Update title based on mode and vanex type
-    title_suffix = ""
-    if mode.upper() == "VANEX":
-        title_suffix = " (Dealer Adjusted)" if vanex_type == 'dealer' else " (Raw)"
+    # Build title with toggle for VEX
+    if mode.upper() == "VEX":
+        title = f"{ticker} {mode} Matrix - {vanex_type.upper()}"
+    else:
+        title = f"{ticker} {mode} Matrix"
     
     fig.update_layout(
-        title=f"{ticker} {mode} Matrix{title_suffix}", 
+        title=title, 
         template="plotly_dark", 
         height=650, 
         margin=dict(l=80, r=20, t=80, b=20),
@@ -491,20 +492,20 @@ def main():
                 
                 st.markdown("---")
                 
+                # VEX toggle above both heatmaps
+                vex_toggle = st.radio(
+                    "VEX Calculation:",
+                    options=['dealer', 'raw'],
+                    horizontal=True,
+                    key='vex_toggle'
+                )
+                
                 col_gex, col_van = st.columns(2)
                 with col_gex: 
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
                 
                 with col_van:
-                    # Add toggle for VANEX type
-                    vanex_toggle = st.radio(
-                        "VANEX Calculation:",
-                        options=['raw', 'dealer'],
-                        format_func=lambda x: "Raw (Customer View)" if x == 'raw' else "Dealer Adjusted (Time-Weighted)",
-                        horizontal=True,
-                        key='vanex_toggle'
-                    )
-                    st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike, vanex_type=vanex_toggle), use_container_width=True)
+                    st.plotly_chart(render_heatmap(df, ticker, S, "VEX", flip_strike, vanex_type=vex_toggle), use_container_width=True)
 
                 # --- DIAGNOSTIC TABLE ---
                 st.markdown("### 🔍 Strike Diagnostics (5 Closest to Spot)")
