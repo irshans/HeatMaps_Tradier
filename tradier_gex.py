@@ -83,7 +83,7 @@ def fetch_data(ticker, max_exp):
         if chain and 'options' in chain and chain['options'] and chain['options']['option']:
             opts = chain['options']['option']
             dfs.append(pd.DataFrame(opts) if isinstance(opts, list) else pd.DataFrame([opts]))
-        prog.progress((i + 1) / len(valid_exps))
+        prog.progress((i + 1) / len(valid_exps)) if len(valid_exps) > 0 else None
     prog.empty()
     return S, pd.concat(dfs, ignore_index=True) if dfs else None
 
@@ -313,9 +313,9 @@ def main():
     s_range = c3.number_input("Strike ±", 5, 500, st.session_state.default_strike_range)
     refresh = c4.button("🔄 Refresh Data")
 
-    if refresh: st.cache_data.clear()
+    if refresh: 
+        st.cache_data.clear()
 
-    @st.fragment(run_every="600s")
     def dashboard_content():
         S, raw_df = fetch_data(ticker, max_exp)
         if S and raw_df is not None:
@@ -492,19 +492,18 @@ def main():
                 
                 st.markdown("---")
                 
-                # VEX toggle above both heatmaps
-                vex_toggle = st.radio(
-                    "VEX Calculation:",
-                    options=['dealer', 'raw'],
-                    horizontal=True,
-                    key='vex_toggle'
-                )
-                
                 col_gex, col_van = st.columns(2)
                 with col_gex: 
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
                 
                 with col_van:
+                    # Moved VEX toggle here so it appears directly above the VEX heatmap
+                    vex_toggle = st.radio(
+                        "VEX Calculation:",
+                        options=['dealer', 'raw'],
+                        horizontal=True,
+                        key='vex_toggle'
+                    )
                     st.plotly_chart(render_heatmap(df, ticker, S, "VEX", flip_strike, vanex_type=vex_toggle), use_container_width=True)
 
                 # --- DIAGNOSTIC TABLE ---
@@ -535,7 +534,7 @@ def main():
                     'Put OI': df_puts.groupby('strike')['oi'].sum()
                 }).fillna(0)
                 
-                strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
+                strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(22)
                 
                 # Find floor and ceiling from full data
                 if not df_calls.empty:
