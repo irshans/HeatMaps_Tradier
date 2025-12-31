@@ -6,26 +6,25 @@ import requests
 from datetime import datetime
 import pytz
 
-# -------------------------------------------------
-# APP CONFIG
-# -------------------------------------------------
+# --- APP CONFIG ---
 st.set_page_config(page_title="GEX & VANEX Pro", page_icon="📊", layout="wide")
 
 st.markdown("""
-<style>
-* { font-family: 'Arial', sans-serif !important; }
-.block-container { padding-top: 24px; padding-bottom: 8px; }
-[data-testid="stMetricValue"] { font-size: 20px !important; }
-h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
+    <style>
+    * { font-family: 'Arial', sans-serif !important; }
+    .block-container { padding-top: 24px; padding-bottom: 8px; }
+    [data-testid="stMetricValue"] { font-size: 20px !important; font-family: 'Arial' !important; }
+    h1, h2, h3 { font-size: 18px !important; margin: 10px 0 6px 0 !important; font-weight: bold; }
+    hr { margin: 15px 0 !important; }
+    [data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# -------------------------------------------------
-# SECRETS
-# -------------------------------------------------
-TRADIER_TOKEN = st.secrets.get("TRADIER_TOKEN")
-if not TRADIER_TOKEN:
-    st.error("Missing TRADIER_TOKEN")
+# --- SECRETS ---
+if "TRADIER_TOKEN" in st.secrets:
+    TRADIER_TOKEN = st.secrets["TRADIER_TOKEN"]
+else:
+    st.error("Please set TRADIER_TOKEN in Streamlit Secrets.")
     st.stop()
 
 BASE_URL = "https://api.tradier.com/v1/"
@@ -37,206 +36,547 @@ CUSTOM_COLORSCALE = [
     [0.92, '#FFDF4A'], [1.00, '#F1F50C']
 ]
 
-# -------------------------------------------------
-# API HELPERS
-# -------------------------------------------------
+# -------------------------
+# API & Processing
+# -------------------------
 def tradier_get(endpoint, params):
-    headers = {
-        "Authorization": f"Bearer {TRADIER_TOKEN}",
-        "Accept": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
     try:
-        r = requests.get(f"{BASE_URL}{endpoint}", params=params, headers=headers, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except:
-        pass
+        response = requests.get(f"{BASE_URL}{endpoint}", params=params, headers=headers, timeout=15)
+        if response.status_code == 200: return response.json()
+    except: pass
     return None
 
 @st.cache_data(ttl=3600)
 def get_market_days():
     open_days = set()
-    now = datetime.now()
-    for m in [0, 1]:
-        dt = now if m == 0 else (now.replace(day=1) + pd.DateOffset(months=1))
-        cal = tradier_get("markets/calendar", {"month": dt.month, "year": dt.year})
+    dt = datetime.now()
+    for month_offset in [0, 1]:
+        target_dt = dt if month_offset == 0 else (dt.replace(day=1) + pd.DateOffset(months=1))
+        cal = tradier_get("markets/calendar", {"month": target_dt.month, "year": target_dt.year})
         try:
-            days = cal["calendar"]["days"]["day"]
-            if isinstance(days, dict):
-                days = [days]
+            days = cal['calendar']['days']['day']
+            if isinstance(days, dict): days = [days]
             for d in days:
-                if d["status"] == "open":
-                    open_days.add(d["date"])
-        except:
-            pass
+                if d.get('status') == 'open': open_days.add(d.get('date'))
+        except: pass
     return open_days
 
-# -------------------------------------------------
-# DATA FETCH
-# -------------------------------------------------
-def fetch_data(symbol, max_exp):
+def fetch_data(ticker, max_exp):
     open_days = get_market_days()
+    quote_data = tradier_get("markets/quotes", {"symbols": ticker})
+    if not quote_data: return None, None
+    quote = quote_data['quotes']['quote']
+    S = float(quote['last']) if isinstance(quote, dict) else float(quote[0]['last'])
+    
+    exp_data = tradier_get("markets/options/expirations", {"symbol": ticker, "includeAllRoots": "true"})
+    if not exp_data: return S, None
+    all_exps = exp_data['expirations']['date']
+    if not isinstance(all_exps, list): all_exps = [all_exps]
+    
+    valid_exps = sorted([exp for exp in all_exps if exp in open_days])[:max_exp]
+    
+    dfs = []
+    prog = st.progress(0, text="Fetching data...")
+    for i, exp in enumerate(valid_exps):
+        chain = tradier_get("markets/options/chains", {"symbol": ticker, "expiration": exp, "greeks": "true"})
+        if chain and 'options' in chain and chain['options'] and chain['options']['option']:
+            opts = chain['options']['option']
+            dfs.append(pd.DataFrame(opts) if isinstance(opts, list) else pd.DataFrame([opts]))
+        prog.progress((i + 1) / len(valid_exps))
+    prog.empty()
+    return S, pd.concat(dfs, ignore_index=True) if dfs else None
 
-    q = tradier_get("markets/quotes", {"symbols": symbol})
-    S = float(q["quotes"]["quote"]["last"])
-
-    exp = tradier_get("markets/options/expirations", {"symbol": symbol})
-    dates = exp["expirations"]["date"]
-    if not isinstance(dates, list):
-        dates = [dates]
-
-    expiries = sorted([d for d in dates if d in open_days])[:max_exp]
-
-    frames = []
-    for d in expiries:
-        chain = tradier_get("markets/options/chains", {
-            "symbol": symbol,
-            "expiration": d,
-            "greeks": "true"
-        })
-        if chain and chain["options"]:
-            opt = chain["options"]["option"]
-            frames.append(pd.DataFrame(opt if isinstance(opt, list) else [opt]))
-
-    return S, pd.concat(frames, ignore_index=True) if frames else None
-
-# -------------------------------------------------
-# EXPOSURE CALCULATION
-# -------------------------------------------------
-def process_exposure(df, S, strike_range):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-    df = df[(df["strike"] >= S - strike_range) & (df["strike"] <= S + strike_range)]
-
-    rows = []
-    today = pd.Timestamp.today()
-
-    for _, r in df.iterrows():
-        g = r.get("greeks")
-        if not g:
-            continue
-
-        gamma = float(g.get("gamma", 0))
-        vega = float(g.get("vega", 0))
-        delta = float(g.get("delta", 0))
-        iv = float(g.get("smv_vol") or g.get("mid_iv") or 0)
-        if iv > 1:
-            iv /= 100
-
-        oi = int(r.get("open_interest", 0))
-        side = 1 if r["option_type"] == "call" else -1
-
-        # ---------------- GEX ----------------
-        gex = side * gamma * (S ** 2) * 0.01 * 100 * oi
-
-        # ---------------- VEX ----------------
-        iv_eff = max(iv, 0.05)
+def process_exposure(df, S, s_range):
+    if df is None or df.empty: return pd.DataFrame()
+    df["strike"] = pd.to_numeric(df["strike"], errors='coerce')
+    df = df[(df["strike"] >= S - s_range) & (df["strike"] <= S + s_range)].copy()
+    
+    today = pd.Timestamp.now()
+    
+    res = []
+    for _, row in df.iterrows():
+        g = row.get('greeks')
+        if not g: continue
+        
+        gamma = float(g.get('gamma', 0) or 0)
+        vega = float(g.get('vega', 0) or 0)
+        delta = float(g.get('delta', 0) or 0)
+        
+        iv = float(g.get('smv_vol') or g.get('mid_iv') or 0)
+        if iv > 1.0: iv /= 100.0
+        
+        oi = int(row.get('open_interest', 0) or 0)
+        side = 1 if row['option_type'].lower() == 'call' else -1
+        K = float(row['strike'])
+        
+        # Standard GEX calculation
+        gex = side * gamma * (S**2) * 0.01 * 100 * oi
+        
+        # VEX calculations (both raw and dealer-adjusted)
+        iv_eff = max(iv, 0.05)  # Use minimum 5% IV
         vanna_raw = (vega * delta) / (S * iv_eff)
-
+        
+        # Raw VANEX (customer perspective)
         vanex_raw = side * vanna_raw * 100 * oi
-
-        expiry = pd.to_datetime(r["expiration_date"])
+        
+        # Dealer VANEX (with time decay and sign flip)
+        expiry = pd.to_datetime(row["expiration_date"])
         tte = max((expiry - today).days, 0)
-        time_weight = np.exp(-tte / 30)
-
+        time_weight = np.exp(-tte / 30)  # Exponential decay with 30-day half-life
         vanex_dealer = -vanna_raw * S * 100 * oi * time_weight
-
-        # ---------------- DEX ----------------
+        
+        # DEX: Positive for net long delta exposure dealers must hedge
         dex = -side * delta * 100 * oi
-
-        rows.append({
-            "strike": r["strike"],
-            "expiry": r["expiration_date"],
+        
+        # Validate calculations
+        if not np.isfinite([gex, vanex_raw, vanex_dealer, dex]).all():
+            continue
+        
+        res.append({
+            "strike": K,
+            "expiry": row['expiration_date'],
             "gex": gex,
-            "vanex_raw": vanex_raw,
+            "vanex": vanex_raw,
             "vanex_dealer": vanex_dealer,
             "dex": dex,
-            "type": r["option_type"],
+            "gamma": gamma * side * oi,
+            "type": row['option_type'].lower(),
             "oi": oi
         })
+    
+    return pd.DataFrame(res)
 
-    return pd.DataFrame(rows)
+def smart_fill_strikes(df, S):
+    """Auto-detect strike interval and fill missing strikes for uniform heatmap"""
+    if df.empty:
+        return df, 5, 25  # Return defaults
+    
+    # Detect actual interval in data
+    strikes = sorted(df['strike'].unique())
+    if len(strikes) > 1:
+        # Calculate most common interval
+        diffs = np.diff(strikes)
+        common_interval = np.median(diffs)
+    else:
+        common_interval = 5
+    
+    # Round to nearest standard interval and set recommended strike range
+    if common_interval <= 1:
+        interval = 1
+        recommended_range = 25
+    elif common_interval <= 2.5:
+        interval = 2.5
+        recommended_range = 45
+    else:
+        interval = 5
+        recommended_range = 80
+    
+    st.info(f"📊 Detected strike interval: ${interval} | Recommended range: ±${recommended_range}")
+    
+    # Create complete strike range
+    min_strike = df['strike'].min()
+    max_strike = df['strike'].max()
+    
+    # Adjust min/max to align with interval
+    min_strike = np.floor(min_strike / interval) * interval
+    max_strike = np.ceil(max_strike / interval) * interval
+    
+    all_strikes = np.arange(min_strike, max_strike + interval, interval)
+    all_expiries = sorted(df['expiry'].unique())
+    
+    # Create full grid
+    full_index = pd.MultiIndex.from_product([all_strikes, all_expiries], 
+                                            names=['strike', 'expiry'])
+    
+    # Aggregate existing data by strike and expiry
+    df_agg = df.groupby(['strike', 'expiry']).agg({
+        'gex': 'sum',
+        'vanex': 'sum',
+        'vanex_dealer': 'sum',
+        'dex': 'sum',
+        'gamma': 'sum',
+        'oi': 'sum'
+    }).reindex(full_index, fill_value=0).reset_index()
+    
+    # Add back type information (for bar charts) - mark filled strikes as 'filled'
+    df_with_type = df.groupby(['strike', 'expiry', 'type']).agg({
+        'gex': 'sum',
+        'vanex': 'sum',
+        'vanex_dealer': 'sum',
+        'dex': 'sum',
+        'gamma': 'sum',
+        'oi': 'sum'
+    }).reset_index()
+    
+    # Merge to preserve type information where available
+    df_final = df_agg.merge(
+        df_with_type[['strike', 'expiry', 'type', 'oi']],
+        on=['strike', 'expiry'],
+        how='left',
+        suffixes=('', '_typed')
+    )
+    
+    # For strikes with data, keep original type; for filled strikes, mark as both
+    df_final['type'] = df_final['type'].fillna('filled')
+    df_final['oi'] = df_final['oi_typed'].fillna(df_final['oi'])
+    df_final = df_final.drop(columns=['oi_typed'], errors='ignore')
+    
+    return df_final, interval, recommended_range
 
-# -------------------------------------------------
-# HEATMAP
-# -------------------------------------------------
-def render_heatmap(df, value_col, title):
-    pivot = df.pivot_table(
-        index="strike",
-        columns="expiry",
-        values=value_col,
-        aggfunc="sum"
-    ).sort_index(ascending=False).fillna(0)
+def find_gamma_flip(df):
+    if df.empty: return None
+    strike_sums = df.groupby('strike')['gex'].sum().sort_index()
+    for i in range(len(strike_sums) - 1):
+        if (strike_sums.iloc[i] * strike_sums.iloc[i+1]) < 0:
+            return strike_sums.index[i] if abs(strike_sums.iloc[i]) < abs(strike_sums.iloc[i+1]) else strike_sums.index[i+1]
+    return None
 
-    z = pivot.values
-    lim = np.max(np.abs(z)) if z.size else 1
+def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='raw'):
+    # Determine which vanex field to use
+    vanex_field = 'vanex' if vanex_type == 'raw' else 'vanex_dealer'
+    value_field = vanex_field if mode.upper() == "VANEX" else mode.lower()
+    
+    pivot = df.pivot_table(index='strike', columns='expiry', values=value_field, aggfunc='sum')
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1).sort_index(ascending=False).fillna(0)
+    
+    z, x_labs, y_labs = pivot.values, pivot.columns.tolist(), pivot.index.tolist()
+    abs_limit = np.max(np.abs(z)) if z.size > 0 else 1.0
+    closest_strike = min(y_labs, key=lambda x: abs(x - S))
+    
+    # Find highest absolute GEX value for star marker (only for GEX mode)
+    max_abs_val = 0
+    max_abs_pos = None
+    if mode.upper() == "GEX":
+        for i, strike in enumerate(y_labs):
+            for j, exp in enumerate(x_labs):
+                if abs(z[i, j]) > max_abs_val:
+                    max_abs_val = abs(z[i, j])
+                    max_abs_pos = (i, j)
 
-    fig = go.Figure(go.Heatmap(
-        z=z,
-        x=pivot.columns,
-        y=pivot.index,
-        colorscale=CUSTOM_COLORSCALE,
-        zmin=-lim,
-        zmax=lim,
-        zmid=0
+    fig = go.Figure(data=go.Heatmap(
+        z=z, 
+        x=x_labs, 
+        y=y_labs, 
+        colorscale=CUSTOM_COLORSCALE, 
+        zmin=-abs_limit, 
+        zmax=abs_limit, 
+        zmid=0,
+        ygap=0,  # Remove gaps between cells for uniform appearance
+        xgap=1
     ))
 
-    fig.update_layout(
-        title=title,
-        template="plotly_dark",
-        height=650,
-        margin=dict(l=80, r=20, t=60, b=20),
-        xaxis=dict(side="top")
-    )
+    for i, strike in enumerate(y_labs):
+        for j, exp in enumerate(x_labs):
+            val = z[i, j]
+            label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
+            
+            # Add star to highest absolute GEX value
+            if mode.upper() == "GEX" and max_abs_pos and (i, j) == max_abs_pos:
+                label += " ⭐"
+            
+            fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, 
+                             font=dict(color="white" if val < 0 else "black", size=9, family="Arial Black"))
 
+    y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
+
+    # Update title based on mode and vanex type
+    title_suffix = ""
+    if mode.upper() == "VANEX":
+        title_suffix = " (Dealer Adjusted)" if vanex_type == 'dealer' else " (Raw)"
+    
+    fig.update_layout(
+        title=f"{ticker} {mode} Matrix{title_suffix}", 
+        template="plotly_dark", 
+        height=650, 
+        margin=dict(l=80, r=20, t=80, b=20),
+        xaxis=dict(side='top', type='category'),
+        yaxis=dict(ticktext=y_text, tickvals=y_labs)
+    )
     return fig
 
-# -------------------------------------------------
-# MAIN
-# -------------------------------------------------
+# -------------------------
+# Main Page
+# -------------------------
 def main():
-    st.markdown("<h2 style='text-align:center;'>📊 GEX / VEX Analytics</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;'>📊 GEX / VANEX Pro Analytics</h2>", unsafe_allow_html=True)
+    
+    c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1], vertical_alignment="bottom")
+    ticker = c1.text_input("Ticker", value="SPY").upper().strip()
+    max_exp = c2.number_input("Expiries", 1, 15, 5)
+    
+    # Dynamic default for strike range - will be updated after data fetch
+    if 'default_strike_range' not in st.session_state:
+        st.session_state.default_strike_range = 25
+    
+    s_range = c3.number_input("Strike ±", 5, 500, st.session_state.default_strike_range)
+    refresh = c4.button("🔄 Refresh Data")
 
-    c1, c2, c3 = st.columns([2, 1, 1])
-    symbol = c1.text_input("Ticker", "SPY")
-    max_exp = c2.number_input("Expiries", 1, 10, 5)
-    strike_range = c3.number_input("Strike ±", 10, 200, 50)
+    if refresh: st.cache_data.clear()
 
-    S, raw = fetch_data(symbol, max_exp)
-    df = process_exposure(raw, S, strike_range)
+    @st.fragment(run_every="600s")
+    def dashboard_content():
+        S, raw_df = fetch_data(ticker, max_exp)
+        if S and raw_df is not None:
+            df = process_exposure(raw_df, S, s_range)
+            if not df.empty:
+                # Apply smart strike filling for uniform heatmap
+                df, interval, recommended_range = smart_fill_strikes(df, S)
+                
+                # Update session state with recommended range for next refresh
+                st.session_state.default_strike_range = recommended_range
+                
+                flip_strike = find_gamma_flip(df)
+                total_dex = df['dex'].sum()
+                
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Net GEX", f"${df['gex'].sum():,.0f}")
+                m2.metric("Dealer Delta (DEX)", f"{total_dex/1e6:.1f}M Shrs", delta=f"{'Short' if total_dex < 0 else 'Long'} Hedged")
+                m3.metric("Gamma Flip", f"${flip_strike:,.0f}" if flip_strike else "N/A")
+                m4.metric("Spot Price", f"${S:,.2f}")
+                
+                # Hedging Pressure Gauge
+                net_gex = df['gex'].sum()
+                if net_gex > 0:
+                    pressure_status = "🟢 Stabilizers"
+                    pressure_desc = "Pos Gamma"
+                else:
+                    pressure_status = "🔴 Forced Sellers"
+                    pressure_desc = "Neg Gamma"
+                m5.metric("Hedging Pressure", pressure_status, delta=pressure_desc)
 
-    if df.empty:
-        st.warning("No data")
-        return
+                st.markdown("---")
+                
+                # --- BAR CHARTS ---
+                col_bar1, col_bar2 = st.columns(2)
+                
+                # Get strikes within ±10 of spot for bar charts (use original non-zero data only)
+                bar_range = 10
+                df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range) & (df['oi'] > 0)].copy()
+                
+                if not df_bar.empty:
+                    # Find floor and ceiling strikes
+                    df_bar_real = df_bar[df_bar['type'] != 'filled']
+                    
+                    call_oi = df_bar_real[df_bar_real['type'] == 'call'].groupby('strike')['oi'].sum()
+                    put_oi = df_bar_real[df_bar_real['type'] == 'put'].groupby('strike')['oi'].sum()
+                    
+                    ceiling_strike = call_oi.idxmax() if not call_oi.empty else None
+                    floor_strike = put_oi.idxmax() if not put_oi.empty else None
+                    
+                    # A) GEX Concentrations by Strike - HORIZONTAL BARS
+                    with col_bar1:
+                        gex_by_strike = df_bar.groupby('strike')['gex'].sum().sort_index(ascending=True)
+                        
+                        fig_gex = go.Figure()
+                        colors = ['#2ecc71' if v > 0 else '#e74c3c' for v in gex_by_strike.values]
+                        
+                        fig_gex.add_trace(go.Bar(
+                            y=gex_by_strike.index,
+                            x=gex_by_strike.values,
+                            orientation='h',
+                            marker_color=colors,
+                            text=[f"${v/1e6:.2f}M" if abs(v) >= 1e6 else f"${v/1e3:.0f}K" for v in gex_by_strike.values],
+                            textposition='outside',
+                            textfont=dict(size=11, family="Arial Black"),
+                            hovertemplate='Strike: $%{y}<br>GEX: $%{x:,.0f}<extra></extra>'
+                        ))
+                        
+                        # Add horizontal line for spot price
+                        fig_gex.add_hline(y=S, line_dash="dash", line_color="yellow", line_width=2)
+                        
+                        # Add floor and ceiling lines
+                        if floor_strike:
+                            fig_gex.add_hline(y=floor_strike, line_dash="dot", line_color="#e67e22", line_width=2)
+                        if ceiling_strike:
+                            fig_gex.add_hline(y=ceiling_strike, line_dash="dot", line_color="#3498db", line_width=2)
+                        
+                        # Create custom y-axis labels with arrow for spot, and markers for floor/ceiling
+                        y_labels = []
+                        for s in gex_by_strike.index:
+                            if abs(s - S) < 0.01:
+                                y_labels.append(f"➔ <b>${s:.2f}</b>")
+                            elif ceiling_strike and abs(s - ceiling_strike) < 0.01:
+                                y_labels.append(f"🔵 ${s:.2f} CEIL")
+                            elif floor_strike and abs(s - floor_strike) < 0.01:
+                                y_labels.append(f"🟠 ${s:.2f} FLOOR")
+                            else:
+                                y_labels.append(f"${s:.2f}")
+                        
+                        fig_gex.update_layout(
+                            title=f"GEX Concentration (±${bar_range})",
+                            template="plotly_dark",
+                            height=350,
+                            showlegend=False,
+                            yaxis=dict(
+                                title="Strike Price",
+                                ticktext=y_labels,
+                                tickvals=gex_by_strike.index
+                            ),
+                            xaxis_title="Gamma Exposure ($)",
+                            margin=dict(l=110, r=80, t=60, b=20)
+                        )
+                        
+                        st.plotly_chart(fig_gex, use_container_width=True)
+                    
+                    # B) Options Inventory (OI) by Strike - HORIZONTAL BARS
+                    with col_bar2:
+                        oi_by_strike = df_bar_real.groupby(['strike', 'type'])['oi'].sum().unstack(fill_value=0)
+                        
+                        fig_oi = go.Figure()
+                        
+                        if 'call' in oi_by_strike.columns:
+                            fig_oi.add_trace(go.Bar(
+                                name='Calls',
+                                y=oi_by_strike.index,
+                                x=oi_by_strike['call'],
+                                orientation='h',
+                                marker_color='#3498db',
+                                text=[f"{int(v):,}" for v in oi_by_strike['call'].values],
+                                textposition='outside',
+                                textfont=dict(size=11, family="Arial Black"),
+                                hovertemplate='Strike: $%{y}<br>Call OI: %{x:,}<extra></extra>'
+                            ))
+                        
+                        if 'put' in oi_by_strike.columns:
+                            fig_oi.add_trace(go.Bar(
+                                name='Puts',
+                                y=oi_by_strike.index,
+                                x=oi_by_strike['put'],
+                                orientation='h',
+                                marker_color='#e67e22',
+                                text=[f"{int(v):,}" for v in oi_by_strike['put'].values],
+                                textposition='outside',
+                                textfont=dict(size=11, family="Arial Black"),
+                                hovertemplate='Strike: $%{y}<br>Put OI: %{x:,}<extra></extra>'
+                            ))
+                        
+                        # Add horizontal line for spot price
+                        fig_oi.add_hline(y=S, line_dash="dash", line_color="yellow", line_width=2)
+                        
+                        # Add floor and ceiling lines
+                        if floor_strike:
+                            fig_oi.add_hline(y=floor_strike, line_dash="dot", line_color="#e67e22", line_width=2)
+                        if ceiling_strike:
+                            fig_oi.add_hline(y=ceiling_strike, line_dash="dot", line_color="#3498db", line_width=2)
+                        
+                        # Create custom y-axis labels with arrow for spot, and markers for floor/ceiling
+                        y_labels_oi = []
+                        for s in oi_by_strike.index:
+                            if abs(s - S) < 0.01:
+                                y_labels_oi.append(f"➔ <b>${s:.2f}</b>")
+                            elif ceiling_strike and abs(s - ceiling_strike) < 0.01:
+                                y_labels_oi.append(f"🔵 ${s:.2f} CEIL")
+                            elif floor_strike and abs(s - floor_strike) < 0.01:
+                                y_labels_oi.append(f"🟠 ${s:.2f} FLOOR")
+                            else:
+                                y_labels_oi.append(f"${s:.2f}")
+                        
+                        fig_oi.update_layout(
+                            title=f"Options Inventory (±${bar_range})",
+                            template="plotly_dark",
+                            height=350,
+                            barmode='stack',
+                            yaxis=dict(
+                                title="Strike Price",
+                                ticktext=y_labels_oi,
+                                tickvals=oi_by_strike.index
+                            ),
+                            xaxis_title="Open Interest",
+                            margin=dict(l=110, r=80, t=60, b=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        
+                        st.plotly_chart(fig_oi, use_container_width=True)
+                
+                st.markdown("---")
+                
+                col_gex, col_van = st.columns(2)
+                with col_gex: 
+                    st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
+                
+                with col_van:
+                    # Add toggle for VANEX type
+                    vanex_toggle = st.radio(
+                        "VANEX Calculation:",
+                        options=['raw', 'dealer'],
+                        format_func=lambda x: "Raw (Customer View)" if x == 'raw' else "Dealer Adjusted (Time-Weighted)",
+                        horizontal=True,
+                        key='vanex_toggle'
+                    )
+                    st.plotly_chart(render_heatmap(df, ticker, S, "VANEX", flip_strike, vanex_type=vanex_toggle), use_container_width=True)
 
-    st.markdown("---")
+                # --- DIAGNOSTIC TABLE ---
+                st.markdown("### 🔍 Strike Diagnostics (5 Closest to Spot)")
+                
+                # Filter out filled strikes (zero OI) for diagnostics
+                df_real = df[df['oi'] > 0].copy()
+                
+                # Create separate dataframes for calls and puts
+                df_calls = df_real[df_real['type'] == 'call']
+                df_puts = df_real[df_real['type'] == 'put']
 
-    col1, col2 = st.columns(2)
+                strike_diag = pd.DataFrame({
+                    'Call GEX': df_calls.groupby('strike')['gex'].sum(),
+                    'Put GEX': df_puts.groupby('strike')['gex'].sum(),
+                    'Net GEX': df_real.groupby('strike')['gex'].sum(),
+                    'Call Vanna (Raw)': df_calls.groupby('strike')['vanex'].sum(),
+                    'Put Vanna (Raw)': df_puts.groupby('strike')['vanex'].sum(),
+                    'Net Vanna (Raw)': df_real.groupby('strike')['vanex'].sum(),
+                    'Call Vanna (Dlr)': df_calls.groupby('strike')['vanex_dealer'].sum(),
+                    'Put Vanna (Dlr)': df_puts.groupby('strike')['vanex_dealer'].sum(),
+                    'Net Vanna (Dlr)': df_real.groupby('strike')['vanex_dealer'].sum(),
+                    'Call Gamma': df_calls.groupby('strike')['gamma'].sum(),
+                    'Put Gamma': df_puts.groupby('strike')['gamma'].sum(),
+                    'Net Gamma': df_real.groupby('strike')['gamma'].sum(),
+                    'Dealer Delta': df_real.groupby('strike')['dex'].sum(),
+                    'Call OI': df_calls.groupby('strike')['oi'].sum(),
+                    'Put OI': df_puts.groupby('strike')['oi'].sum()
+                }).fillna(0)
+                
+                strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
+                
+                # Find floor and ceiling from full data
+                if not df_calls.empty:
+                    ceiling_strike_full = df_calls.groupby('strike')['oi'].sum().idxmax()
+                else:
+                    ceiling_strike_full = None
+                    
+                if not df_puts.empty:
+                    floor_strike_full = df_puts.groupby('strike')['oi'].sum().idxmax()
+                else:
+                    floor_strike_full = None
+                
+                # Add labels column for floor/ceiling
+                strike_diag['Label'] = ''
+                if ceiling_strike_full and ceiling_strike_full in strike_diag.index:
+                    strike_diag.loc[ceiling_strike_full, 'Label'] = '🔵 CEILING'
+                if floor_strike_full and floor_strike_full in strike_diag.index:
+                    strike_diag.loc[floor_strike_full, 'Label'] = '🟠 FLOOR'
+                
+                # Using np.abs to avoid Index object error
+                dist_idx = np.abs(strike_diag.index - S).argsort()[:5]
+                closest_strikes = strike_diag.iloc[dist_idx].sort_index(ascending=False)
 
-    with col1:
-        st.plotly_chart(
-            render_heatmap(df, "gex", f"{symbol} GEX"),
-            use_container_width=True
-        )
+                def color_greeks(val):
+                    color = '#2ecc71' if val > 0 else '#e74c3c'
+                    return f'color: {color}'
 
-    with col2:
-        # 🔘 VEX TOGGLE (DEFAULT = DEALER / SKYLIT)
-        vex_mode = st.radio(
-            "VEX Calculation",
-            ["Dealer (Skylit-style)", "Raw (Sensitivity)"],
-            index=0,
-            horizontal=True
-        )
+                st.dataframe(
+                    closest_strikes.style.format({
+                        'Call GEX': '${:,.0f}', 'Put GEX': '${:,.0f}', 'Net GEX': '${:,.0f}',
+                        'Call Vanna (Raw)': '${:,.0f}', 'Put Vanna (Raw)': '${:,.0f}', 'Net Vanna (Raw)': '${:,.0f}',
+                        'Call Vanna (Dlr)': '${:,.0f}', 'Put Vanna (Dlr)': '${:,.0f}', 'Net Vanna (Dlr)': '${:,.0f}',
+                        'Call Gamma': '{:,.2f}', 'Put Gamma': '{:,.2f}', 'Net Gamma': '{:,.2f}',
+                        'Dealer Delta': '{:,.0f}', 'Dist %': '{:.2f}%',
+                        'Call OI': '{:,.0f}', 'Put OI': '{:,.0f}'
+                    }).map(color_greeks, subset=['Net GEX', 'Net Vanna (Raw)', 'Net Vanna (Dlr)', 'Net Gamma', 'Dealer Delta']),
+                    use_container_width=True
+                )
+            else: st.warning("No data in range.")
+        else: st.error("API Error.")
 
-        vex_col = "vanex_dealer" if vex_mode.startswith("Dealer") else "vanex_raw"
-        vex_title = f"{symbol} {vex_mode} VEX"
-
-        st.plotly_chart(
-            render_heatmap(df, vex_col, vex_title),
-            use_container_width=True
-        )
+    dashboard_content()
 
 if __name__ == "__main__":
     main()
