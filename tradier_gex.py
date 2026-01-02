@@ -244,15 +244,14 @@ def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='dealer'):
     abs_limit = np.max(np.abs(z)) if z.size > 0 else 1.0
     closest_strike = min(y_labs, key=lambda x: abs(x - S))
     
-    # Find highest absolute GEX value for star marker (only for GEX mode)
+    # Find highest absolute value for star marker
     max_abs_val = 0
     max_abs_pos = None
-    if mode.upper() == "GEX":
-        for i, strike in enumerate(y_labs):
-            for j, exp in enumerate(x_labs):
-                if abs(z[i, j]) > max_abs_val:
-                    max_abs_val = abs(z[i, j])
-                    max_abs_pos = (i, j)
+    for i, strike in enumerate(y_labs):
+        for j, exp in enumerate(x_labs):
+            if abs(z[i, j]) > max_abs_val:
+                max_abs_val = abs(z[i, j])
+                max_abs_pos = (i, j)
 
     fig = go.Figure(data=go.Heatmap(
         z=z, 
@@ -262,7 +261,7 @@ def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='dealer'):
         zmin=-abs_limit, 
         zmax=abs_limit, 
         zmid=0,
-        ygap=0,  # Remove gaps between cells for uniform appearance
+        ygap=0,
         xgap=1
     ))
 
@@ -271,8 +270,8 @@ def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='dealer'):
             val = z[i, j]
             label = f"${val/1e3:,.0f}K" if abs(val) >= 1e3 else f"${val:.0f}"
             
-            # Add star to highest absolute GEX value
-            if mode.upper() == "GEX" and max_abs_pos and (i, j) == max_abs_pos:
+            # Add star to highest absolute value
+            if max_abs_pos and (i, j) == max_abs_pos:
                 label += " ⭐"
             
             fig.add_annotation(x=exp, y=strike, text=label, showarrow=False, 
@@ -306,17 +305,34 @@ def main():
     ticker = c1.text_input("Ticker", value="SPY").upper().strip()
     max_exp = c2.number_input("Expiries", 1, 15, 5)
     
-    # Dynamic default for strike range - will be updated after data fetch
+    # Dynamic default for strike range based on ticker
     if 'default_strike_range' not in st.session_state:
+        st.session_state.default_strike_range = 80 if ticker == "SPX" else 25
+    
+    # Update default if ticker changes to/from SPX
+    if ticker == "SPX" and st.session_state.default_strike_range == 25:
+        st.session_state.default_strike_range = 80
+    elif ticker != "SPX" and st.session_state.default_strike_range == 80:
         st.session_state.default_strike_range = 25
     
     s_range = c3.number_input("Strike ±", 5, 500, st.session_state.default_strike_range)
     refresh = c4.button("🔄 Refresh Data")
 
-    if refresh: st.cache_data.clear()
+    if refresh: 
+        st.cache_data.clear()
+        st.session_state.trigger_refresh = True
+    
+    # Initialize trigger if not exists
+    if 'trigger_refresh' not in st.session_state:
+        st.session_state.trigger_refresh = True
 
     @st.fragment(run_every="600s")
     def dashboard_content():
+        # Only fetch data if refresh was triggered
+        if not st.session_state.trigger_refresh:
+            st.info("👆 Adjust settings above and click 'Refresh Data' to load")
+            return
+        
         S, raw_df = fetch_data(ticker, max_exp)
         if S and raw_df is not None:
             df = process_exposure(raw_df, S, s_range)
@@ -351,8 +367,8 @@ def main():
                 # --- BAR CHARTS ---
                 col_bar1, col_bar2 = st.columns(2)
                 
-                # Get strikes within ±10 of spot for bar charts (use original non-zero data only)
-                bar_range = 10
+                # Dynamic bar range based on interval
+                bar_range = 20 if interval >= 5 else 10
                 df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range) & (df['oi'] > 0)].copy()
                 
                 if not df_bar.empty:
@@ -492,19 +508,23 @@ def main():
                 
                 st.markdown("---")
                 
-                # VEX toggle above both heatmaps
-                vex_toggle = st.radio(
-                    "VEX Calculation:",
-                    options=['dealer', 'raw'],
-                    horizontal=True,
-                    key='vex_toggle'
-                )
-                
                 col_gex, col_van = st.columns(2)
                 with col_gex: 
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
                 
                 with col_van:
+                    # VEX toggle in title area
+                    col_title, col_toggle = st.columns([1, 1])
+                    with col_title:
+                        st.markdown(f"### {ticker} VEX Matrix")
+                    with col_toggle:
+                        vex_toggle = st.radio(
+                            "",
+                            options=['dealer', 'raw'],
+                            horizontal=True,
+                            key='vex_toggle',
+                            label_visibility='collapsed'
+                        )
                     st.plotly_chart(render_heatmap(df, ticker, S, "VEX", flip_strike, vanex_type=vex_toggle), use_container_width=True)
 
                 # --- DIAGNOSTIC TABLE ---
