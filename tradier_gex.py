@@ -280,10 +280,10 @@ def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='dealer'):
     y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
 
     # Simple title without mode suffix for VEX
-    title = f"{ticker} {mode} Matrix"
+    #title = f"{ticker} {mode} Matrix"
     
     fig.update_layout(
-        title=title, 
+        #title=title, 
         template="plotly_dark", 
         height=650, 
         margin=dict(l=80, r=20, t=80, b=20),
