@@ -333,14 +333,30 @@ def main():
                 flip_strike = find_gamma_flip(df)
                 total_dex = df['dex'].sum()
                 
-                m1, m2, m3, m4, m5 = st.columns(5)
+                # Determine market regime
+                net_gex = df['gex'].sum()
+                if flip_strike:
+                    if S > flip_strike:
+                        regime = "📈 Above Flip"
+                        regime_desc = "Positive Gamma Zone"
+                    else:
+                        regime = "📉 Below Flip"
+                        regime_desc = "Negative Gamma Zone"
+                else:
+                    if net_gex > 0:
+                        regime = "📈 Positive Regime"
+                        regime_desc = "Stable"
+                    else:
+                        regime = "📉 Negative Regime"
+                        regime_desc = "Volatile"
+                
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
                 m1.metric("Net GEX", f"${df['gex'].sum():,.0f}")
                 m2.metric("Dealer Delta (DEX)", f"{total_dex/1e6:.1f}M Shrs", delta=f"{'Short' if total_dex < 0 else 'Long'} Hedged")
                 m3.metric("Gamma Flip", f"${flip_strike:,.0f}" if flip_strike else "N/A")
                 m4.metric("Spot Price", f"${S:,.2f}")
                 
                 # Hedging Pressure Gauge
-                net_gex = df['gex'].sum()
                 if net_gex > 0:
                     pressure_status = "🟢 Stabilizers"
                     pressure_desc = "Pos Gamma"
@@ -348,6 +364,9 @@ def main():
                     pressure_status = "🔴 Forced Sellers"
                     pressure_desc = "Neg Gamma"
                 m5.metric("Hedging Pressure", pressure_status, delta=pressure_desc)
+                
+                # Market Regime
+                m6.metric("Market Regime", regime, delta=regime_desc)
 
                 st.markdown("---")
                 
