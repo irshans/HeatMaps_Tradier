@@ -185,42 +185,32 @@ def smart_fill_strikes(df, S):
     all_strikes = np.arange(min_strike, max_strike + interval, interval)
     all_expiries = sorted(df['expiry'].unique())
     
-    # Create full grid
-    full_index = pd.MultiIndex.from_product([all_strikes, all_expiries], 
-                                            names=['strike', 'expiry'])
+    # Create full grid with strike, expiry, AND type
+    full_data = []
+    for strike in all_strikes:
+        for expiry in all_expiries:
+            # Check if this strike-expiry combination exists in original data
+            existing = df[(df['strike'] == strike) & (df['expiry'] == expiry)]
+            
+            if not existing.empty:
+                # Keep original data
+                full_data.append(existing)
+            else:
+                # Add zero-filled rows for both call and put
+                for option_type in ['call', 'put']:
+                    full_data.append(pd.DataFrame([{
+                        'strike': strike,
+                        'expiry': expiry,
+                        'gex': 0,
+                        'vanex': 0,
+                        'vanex_dealer': 0,
+                        'dex': 0,
+                        'gamma': 0,
+                        'oi': 0,
+                        'type': option_type
+                    }]))
     
-    # Aggregate existing data by strike and expiry
-    df_agg = df.groupby(['strike', 'expiry']).agg({
-        'gex': 'sum',
-        'vanex': 'sum',
-        'vanex_dealer': 'sum',
-        'dex': 'sum',
-        'gamma': 'sum',
-        'oi': 'sum'
-    }).reindex(full_index, fill_value=0).reset_index()
-    
-    # Add back type information (for bar charts) - mark filled strikes as 'filled'
-    df_with_type = df.groupby(['strike', 'expiry', 'type']).agg({
-        'gex': 'sum',
-        'vanex': 'sum',
-        'vanex_dealer': 'sum',
-        'dex': 'sum',
-        'gamma': 'sum',
-        'oi': 'sum'
-    }).reset_index()
-    
-    # Merge to preserve type information where available
-    df_final = df_agg.merge(
-        df_with_type[['strike', 'expiry', 'type', 'oi']],
-        on=['strike', 'expiry'],
-        how='left',
-        suffixes=('', '_typed')
-    )
-    
-    # For strikes with data, keep original type; for filled strikes, mark as both
-    df_final['type'] = df_final['type'].fillna('filled')
-    df_final['oi'] = df_final['oi_typed'].fillna(df_final['oi'])
-    df_final = df_final.drop(columns=['oi_typed'], errors='ignore')
+    df_final = pd.concat(full_data, ignore_index=True) if full_data else df
     
     return df_final, interval, recommended_range
 
@@ -505,23 +495,20 @@ def main():
                 
                 st.markdown("---")
                 
+                # VEX toggle above both charts to keep alignment
+                vex_toggle = st.radio(
+                    "",
+                    options=['dealer', 'raw'],
+                    horizontal=True,
+                    key='vex_toggle',
+                    label_visibility='collapsed'
+                )
+                
                 col_gex, col_van = st.columns(2)
                 with col_gex: 
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
                 
                 with col_van:
-                    # VEX toggle in compact layout
-                    col_label, col_toggle = st.columns([2, 1])
-                    with col_label:
-                        st.markdown("")  # Empty to maintain spacing
-                    with col_toggle:
-                        vex_toggle = st.radio(
-                            "",
-                            options=['dealer', 'raw'],
-                            horizontal=True,
-                            key='vex_toggle',
-                            label_visibility='collapsed'
-                        )
                     st.plotly_chart(render_heatmap(df, ticker, S, "VEX", flip_strike, vanex_type=vex_toggle), use_container_width=True)
 
                 # --- DIAGNOSTIC TABLE ---
