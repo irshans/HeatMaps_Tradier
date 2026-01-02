@@ -354,8 +354,14 @@ def main():
                 # --- BAR CHARTS ---
                 col_bar1, col_bar2 = st.columns(2)
                 
-                # Dynamic bar range based on interval
-                bar_range = 20 if interval >= 5 else 10
+                # Dynamic bar range - special handling for SPX
+                if ticker == "SPX":
+                    bar_range = 50  # Show ±$50 for SPX (about 10 strikes at $5 intervals)
+                elif interval >= 5:
+                    bar_range = 20  # Other $5 interval tickers
+                else:
+                    bar_range = 10  # $1-2.5 interval tickers
+                    
                 df_bar = df[(df['strike'] >= S - bar_range) & (df['strike'] <= S + bar_range) & (df['oi'] > 0)].copy()
                 
                 if not df_bar.empty:
@@ -495,21 +501,12 @@ def main():
                 
                 st.markdown("---")
                 
-                # VEX toggle above both charts to keep alignment
-                vex_toggle = st.radio(
-                    "",
-                    options=['dealer', 'raw'],
-                    horizontal=True,
-                    key='vex_toggle',
-                    label_visibility='collapsed'
-                )
-                
                 col_gex, col_van = st.columns(2)
                 with col_gex: 
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
                 
                 with col_van:
-                    st.plotly_chart(render_heatmap(df, ticker, S, "VEX", flip_strike, vanex_type=vex_toggle), use_container_width=True)
+                    st.plotly_chart(render_heatmap(df, ticker, S, "VEX", flip_strike, vanex_type='dealer'), use_container_width=True)
 
                 # --- DIAGNOSTIC TABLE ---
                 st.markdown("### 🔍 Strike Diagnostics (5 Closest to Spot)")
