@@ -510,10 +510,10 @@ def main():
                     st.plotly_chart(render_heatmap(df, ticker, S, "GEX", flip_strike), use_container_width=True)
                 
                 with col_van:
-                    # VEX toggle in title area
-                    col_title, col_toggle = st.columns([1, 1])
-                    with col_title:
-                        st.markdown(f"### {ticker} VEX Matrix")
+                    # VEX toggle in compact layout
+                    col_label, col_toggle = st.columns([2, 1])
+                    with col_label:
+                        st.markdown("")  # Empty to maintain spacing
                     with col_toggle:
                         vex_toggle = st.radio(
                             "",
@@ -534,34 +534,59 @@ def main():
                 df_calls = df_real[df_real['type'] == 'call']
                 df_puts = df_real[df_real['type'] == 'put']
 
+                # Aggregate by strike for each type separately
+                call_metrics = df_calls.groupby('strike').agg({
+                    'gex': 'sum',
+                    'vanex': 'sum',
+                    'vanex_dealer': 'sum',
+                    'gamma': 'sum',
+                    'oi': 'sum'
+                })
+                
+                put_metrics = df_puts.groupby('strike').agg({
+                    'gex': 'sum',
+                    'vanex': 'sum',
+                    'vanex_dealer': 'sum',
+                    'gamma': 'sum',
+                    'oi': 'sum'
+                })
+                
+                net_metrics = df_real.groupby('strike').agg({
+                    'gex': 'sum',
+                    'vanex': 'sum',
+                    'vanex_dealer': 'sum',
+                    'gamma': 'sum',
+                    'dex': 'sum'
+                })
+
                 strike_diag = pd.DataFrame({
-                    'Call GEX': df_calls.groupby('strike')['gex'].sum(),
-                    'Put GEX': df_puts.groupby('strike')['gex'].sum(),
-                    'Net GEX': df_real.groupby('strike')['gex'].sum(),
-                    'Call Vanna (Raw)': df_calls.groupby('strike')['vanex'].sum(),
-                    'Put Vanna (Raw)': df_puts.groupby('strike')['vanex'].sum(),
-                    'Net Vanna (Raw)': df_real.groupby('strike')['vanex'].sum(),
-                    'Call Vanna (Dlr)': df_calls.groupby('strike')['vanex_dealer'].sum(),
-                    'Put Vanna (Dlr)': df_puts.groupby('strike')['vanex_dealer'].sum(),
-                    'Net Vanna (Dlr)': df_real.groupby('strike')['vanex_dealer'].sum(),
-                    'Call Gamma': df_calls.groupby('strike')['gamma'].sum(),
-                    'Put Gamma': df_puts.groupby('strike')['gamma'].sum(),
-                    'Net Gamma': df_real.groupby('strike')['gamma'].sum(),
-                    'Dealer Delta': df_real.groupby('strike')['dex'].sum(),
-                    'Call OI': df_calls.groupby('strike')['oi'].sum(),
-                    'Put OI': df_puts.groupby('strike')['oi'].sum()
+                    'Call GEX': call_metrics['gex'],
+                    'Put GEX': put_metrics['gex'],
+                    'Net GEX': net_metrics['gex'],
+                    'Call Vanna (Raw)': call_metrics['vanex'],
+                    'Put Vanna (Raw)': put_metrics['vanex'],
+                    'Net Vanna (Raw)': net_metrics['vanex'],
+                    'Call Vanna (Dlr)': call_metrics['vanex_dealer'],
+                    'Put Vanna (Dlr)': put_metrics['vanex_dealer'],
+                    'Net Vanna (Dlr)': net_metrics['vanex_dealer'],
+                    'Call Gamma': call_metrics['gamma'],
+                    'Put Gamma': put_metrics['gamma'],
+                    'Net Gamma': net_metrics['gamma'],
+                    'Dealer Delta': net_metrics['dex'],
+                    'Call OI': call_metrics['oi'],
+                    'Put OI': put_metrics['oi']
                 }).fillna(0)
                 
                 strike_diag['Dist %'] = ((strike_diag.index - S) / S * 100).round(2)
                 
                 # Find floor and ceiling from full data
-                if not df_calls.empty:
-                    ceiling_strike_full = df_calls.groupby('strike')['oi'].sum().idxmax()
+                if not call_metrics.empty:
+                    ceiling_strike_full = call_metrics['oi'].idxmax()
                 else:
                     ceiling_strike_full = None
                     
-                if not df_puts.empty:
-                    floor_strike_full = df_puts.groupby('strike')['oi'].sum().idxmax()
+                if not put_metrics.empty:
+                    floor_strike_full = put_metrics['oi'].idxmax()
                 else:
                     floor_strike_full = None
                 
