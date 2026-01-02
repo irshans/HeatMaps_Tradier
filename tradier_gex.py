@@ -279,11 +279,8 @@ def render_heatmap(df, ticker, S, mode, flip_strike, vanex_type='dealer'):
 
     y_text = [f"➔ <b>{s}</b>" if s == closest_strike else (f"⚠️ <b>{s} FLIP</b>" if s == flip_strike else str(s)) for s in y_labs]
 
-    # Build title with toggle for VEX
-    if mode.upper() == "VEX":
-        title = f"{ticker} {mode} Matrix - {vanex_type.upper()}"
-    else:
-        title = f"{ticker} {mode} Matrix"
+    # Simple title without mode suffix for VEX
+    title = f"{ticker} {mode} Matrix"
     
     fig.update_layout(
         title=title, 
